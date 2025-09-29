@@ -25,6 +25,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -584,7 +585,7 @@ func (h Harness) Diff(ctx context.Context, o ...Option) (bool, error) {
 }
 
 // Apply a Terraform configuration.
-func (h Harness) Apply(ctx context.Context, o ...Option) error {
+func (h Harness) Apply(ctx context.Context, ws string, o ...Option) error {
 	ao := &options{}
 	for _, fn := range o {
 		fn(ao)
@@ -611,8 +612,12 @@ func (h Harness) Apply(ctx context.Context, o ...Option) error {
 	// In case of terraform apply
 	// 0 - Succeeded
 	// Non Zero output - Errored
-
-	log, err := runCommand(ctx, cmd)
+	f, err := os.Create(filepath.Join("/logs", ws))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	log, err := runCommandv2(ctx, cmd, f)
 	switch cmd.ProcessState.ExitCode() {
 	case 0:
 		if h.EnableTerraformCLILogging {
@@ -629,7 +634,7 @@ func (h Harness) Apply(ctx context.Context, o ...Option) error {
 }
 
 // Destroy a Terraform configuration.
-func (h Harness) Destroy(ctx context.Context, o ...Option) error {
+func (h Harness) Destroy(ctx context.Context, ws string, o ...Option) error {
 	do := &options{}
 	for _, fn := range o {
 		fn(do)
@@ -652,8 +657,12 @@ func (h Harness) Destroy(ctx context.Context, o ...Option) error {
 		rwmutex.RLock()
 		defer rwmutex.RUnlock()
 	}
-
-	log, err := runCommand(ctx, cmd)
+	f, err := os.Create(filepath.Join("/logs", ws))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	log, err := runCommandv2(ctx, cmd, f)
 
 	// In case of terraform destroy
 	// 0 - Succeeded
@@ -686,6 +695,35 @@ func runCommand(ctx context.Context, c *exec.Cmd) ([]byte, error) {
 		defer close(ch)
 		r, e := c.Output()
 		ch <- cmdResult{out: r, err: e}
+	}()
+	select {
+	case <-ctx.Done():
+		err := ctx.Err()
+		// This could be container termination or the reconciliation deadline was exceeded.  Either way send a
+		// SIGTERM to the running process and wait for either the command to finish or the process to get killed.
+		e := c.Process.Signal(syscall.SIGTERM)
+		if e != nil {
+			return nil, errors.Wrap(errors.Wrap(err, errRunCommand), errors.Wrap(e, errSigTerm).Error())
+		}
+		e = c.Wait()
+		if e != nil {
+			return nil, errors.Wrap(errors.Wrap(err, errRunCommand), errors.Wrap(e, errWaitTerm).Error())
+		}
+		return nil, errors.Wrap(err, errRunCommand)
+	case res := <-ch:
+		return res.out, res.err
+	}
+}
+
+// runCommand executes the requested command and sends the process SIGTERM if the context finishes before the command
+func runCommandv2(ctx context.Context, c *exec.Cmd, f io.Writer) ([]byte, error) {
+	ch := make(chan cmdResult, 1)
+	go func() {
+		defer close(ch)
+		c.Stderr = f
+		c.Stdout = f
+		e := c.Run()
+		ch <- cmdResult{err: e}
 	}()
 	select {
 	case <-ctx.Done():

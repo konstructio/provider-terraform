@@ -107,8 +107,8 @@ type tfclient interface {
 	Outputs(ctx context.Context) ([]terraform.Output, error)
 	Resources(ctx context.Context) ([]string, error)
 	Diff(ctx context.Context, o ...terraform.Option) (bool, error)
-	Apply(ctx context.Context, o ...terraform.Option) error
-	Destroy(ctx context.Context, o ...terraform.Option) error
+	Apply(ctx context.Context, ws string, o ...terraform.Option) error
+	Destroy(ctx context.Context, ws string, o ...terraform.Option) error
 	DeleteCurrentWorkspace(ctx context.Context) error
 	GenerateChecksum(ctx context.Context) (string, error)
 }
@@ -442,7 +442,7 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 	}
 
 	o = append(o, terraform.WithArgs(cr.Spec.ForProvider.ApplyArgs))
-	if err := c.tf.Apply(ctx, o...); err != nil {
+	if err := c.tf.Apply(ctx, cr.Name, o...); err != nil {
 		return managed.ExternalUpdate{}, errors.Wrap(err, errApply)
 	}
 
@@ -473,7 +473,7 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 	}
 
 	o = append(o, terraform.WithArgs(cr.Spec.ForProvider.DestroyArgs))
-	return errors.Wrap(c.tf.Destroy(ctx, o...), errDestroy)
+	return errors.Wrap(c.tf.Destroy(ctx, cr.Name, o...), errDestroy)
 }
 
 //nolint:gocyclo

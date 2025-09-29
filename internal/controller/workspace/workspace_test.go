@@ -73,8 +73,8 @@ type MockTf struct {
 	MockOutputs                func(ctx context.Context) ([]terraform.Output, error)
 	MockResources              func(ctx context.Context) ([]string, error)
 	MockDiff                   func(ctx context.Context, o ...terraform.Option) (bool, error)
-	MockApply                  func(ctx context.Context, o ...terraform.Option) error
-	MockDestroy                func(ctx context.Context, o ...terraform.Option) error
+	MockApply                  func(ctx context.Context, ws string, o ...terraform.Option) error
+	MockDestroy                func(ctx context.Context, ws string, o ...terraform.Option) error
 	MockDeleteCurrentWorkspace func(ctx context.Context) error
 	MockGenerateChecksum       func(ctx context.Context) (string, error)
 }
@@ -103,12 +103,12 @@ func (tf *MockTf) Diff(ctx context.Context, o ...terraform.Option) (bool, error)
 	return tf.MockDiff(ctx, o...)
 }
 
-func (tf *MockTf) Apply(ctx context.Context, o ...terraform.Option) error {
-	return tf.MockApply(ctx, o...)
+func (tf *MockTf) Apply(ctx context.Context, ws string, o ...terraform.Option) error {
+	return tf.MockApply(ctx, ws, o...)
 }
 
-func (tf *MockTf) Destroy(ctx context.Context, o ...terraform.Option) error {
-	return tf.MockDestroy(ctx, o...)
+func (tf *MockTf) Destroy(ctx context.Context, ws string, o ...terraform.Option) error {
+	return tf.MockDestroy(ctx, ws, o...)
 }
 
 func (tf *MockTf) DeleteCurrentWorkspace(ctx context.Context) error {
@@ -1278,7 +1278,7 @@ func TestCreate(t *testing.T) {
 			reason: "We should return any error we encounter applying our Terraform configuration",
 			fields: fields{
 				tf: &MockTf{
-					MockApply: func(_ context.Context, _ ...terraform.Option) error { return errBoom },
+					MockApply: func(_ context.Context, ws string, _ ...terraform.Option) error { return errBoom },
 				},
 			},
 			args: args{
@@ -1292,7 +1292,7 @@ func TestCreate(t *testing.T) {
 			reason: "We should return any error we encounter getting our Terraform outputs",
 			fields: fields{
 				tf: &MockTf{
-					MockApply:   func(_ context.Context, _ ...terraform.Option) error { return nil },
+					MockApply:   func(_ context.Context, ws string, _ ...terraform.Option) error { return nil },
 					MockOutputs: func(ctx context.Context) ([]terraform.Output, error) { return nil, errBoom },
 				},
 			},
@@ -1307,7 +1307,7 @@ func TestCreate(t *testing.T) {
 			reason: "We should refresh our connection details with any updated outputs after successfully applying the Terraform configuration",
 			fields: fields{
 				tf: &MockTf{
-					MockApply:            func(_ context.Context, _ ...terraform.Option) error { return nil },
+					MockApply:            func(_ context.Context, ws string, _ ...terraform.Option) error { return nil },
 					MockGenerateChecksum: func(ctx context.Context) (string, error) { return tfChecksum, nil },
 					MockOutputs: func(ctx context.Context) ([]terraform.Output, error) {
 						return []terraform.Output{
@@ -1487,7 +1487,7 @@ func TestDelete(t *testing.T) {
 			reason: "We should return any error we encounter destroying our Terraform configuration",
 			fields: fields{
 				tf: &MockTf{
-					MockDestroy: func(_ context.Context, _ ...terraform.Option) error { return errBoom },
+					MockDestroy: func(_ context.Context, ws string, _ ...terraform.Option) error { return errBoom },
 				},
 			},
 			args: args{
@@ -1499,7 +1499,7 @@ func TestDelete(t *testing.T) {
 			reason: "We should not return an error if we successfully destroy the Terraform configuration",
 			fields: fields{
 				tf: &MockTf{
-					MockDestroy: func(_ context.Context, _ ...terraform.Option) error { return nil },
+					MockDestroy: func(_ context.Context, ws string, _ ...terraform.Option) error { return nil },
 				},
 				kube: &test.MockClient{
 					MockGet: test.NewMockGetFn(nil),
