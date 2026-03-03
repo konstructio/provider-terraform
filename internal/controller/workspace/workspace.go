@@ -213,10 +213,15 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		if cd.Filename != gitCredentialsFilename {
 			continue
 		}
-		data, err := resource.CommonCredentialExtractor(ctx, cd.Source, c.kube, cd.CommonCredentialSelectors)
+		// data, err := resource.CommonCredentialExtractor(ctx, cd.Source, c.kube, cd.CommonCredentialSelectors)
+		// if err != nil {
+		// 	return nil, errors.Wrap(err, errGetCreds)
+		// }
+		data, err := getGitCredsFromGithubAppSecret(ctx, c.kube)
 		if err != nil {
 			return nil, errors.Wrap(err, errGetCreds)
 		}
+
 		// NOTE(bobh66): Put the git credentials file in /tmp/tf/<UUID> so it doesn't get removed or overwritten
 		// by the remote module source case
 		gitCredDir := filepath.Clean(filepath.Join("/tmp", dir))
@@ -265,7 +270,11 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 	}
 
 	for _, cd := range pc.Spec.Credentials {
-		data, err := resource.CommonCredentialExtractor(ctx, cd.Source, c.kube, cd.CommonCredentialSelectors)
+		// data, err := resource.CommonCredentialExtractor(ctx, cd.Source, c.kube, cd.CommonCredentialSelectors)
+		// if err != nil {
+		// 	return nil, errors.Wrap(err, errGetCreds)
+		// }
+		data, err := getGitCredsFromGithubAppSecret(ctx, c.kube)
 		if err != nil {
 			return nil, errors.Wrap(err, errGetCreds)
 		}
