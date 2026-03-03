@@ -38,6 +38,8 @@ import (
 
 	"github.com/crossplane/crossplane-runtime/pkg/logging"
 	"github.com/pkg/errors"
+
+	"github.com/upbound/provider-terraform/pkg/metrics"
 )
 
 // Error strings.
@@ -205,8 +207,14 @@ func (h Harness) Init(ctx context.Context, o ...InitOption) error {
 		defer rwmutex.Unlock()
 	}
 
+	timer := metrics.NewTerraformOperationTimer(filepath.Base(h.Dir), "init")
 	_, err := runCommand(ctx, cmd)
-	return Classify(err)
+	if err != nil {
+		timer.RecordFailure()
+		return Classify(err)
+	}
+	timer.RecordSuccess()
+	return nil
 }
 
 // Validate a Terraform configuration. Note that there may be interplay between
@@ -567,19 +575,24 @@ func (h Harness) Diff(ctx context.Context, o ...Option) (bool, error) {
 	// 0 - Succeeded, diff is empty (no changes)
 	// 1 - Errored
 	// 2 - Succeeded, there is a diff
+	timer := metrics.NewTerraformOperationTimer(filepath.Base(h.Dir), "plan")
 	log, err := runCommand(ctx, cmd)
 	switch cmd.ProcessState.ExitCode() {
 	case 1:
+		timer.RecordFailure()
 		ee := &exec.ExitError{}
 		errors.As(err, &ee)
 		if h.EnableTerraformCLILogging {
 			h.Logger.Info(string(ee.Stderr), "operation", "plan")
 		}
 	case 2:
+		timer.RecordSuccess()
 		if h.EnableTerraformCLILogging {
 			h.Logger.Info(string(log), "operation", "plan")
 		}
 		return true, nil
+	default:
+		timer.RecordSuccess()
 	}
 	return false, Classify(err)
 }
@@ -617,13 +630,16 @@ func (h Harness) Apply(ctx context.Context, ws string, o ...Option) error {
 		return err
 	}
 	defer f.Close()
+	timer := metrics.NewTerraformOperationTimer(filepath.Base(h.Dir), "apply")
 	log, err := runCommandv2(ctx, cmd, f)
 	switch cmd.ProcessState.ExitCode() {
 	case 0:
+		timer.RecordSuccess()
 		if h.EnableTerraformCLILogging {
 			h.Logger.Info(string(log), "operation", "apply")
 		}
 	default:
+		timer.RecordFailure()
 		ee := &exec.ExitError{}
 		errors.As(err, &ee)
 		if h.EnableTerraformCLILogging {
@@ -662,6 +678,7 @@ func (h Harness) Destroy(ctx context.Context, ws string, o ...Option) error {
 		return err
 	}
 	defer f.Close()
+	timer := metrics.NewTerraformOperationTimer(filepath.Base(h.Dir), "destroy")
 	log, err := runCommandv2(ctx, cmd, f)
 
 	// In case of terraform destroy
@@ -669,10 +686,12 @@ func (h Harness) Destroy(ctx context.Context, ws string, o ...Option) error {
 	// Non Zero output - Errored
 	switch cmd.ProcessState.ExitCode() {
 	case 0:
+		timer.RecordSuccess()
 		if h.EnableTerraformCLILogging {
 			h.Logger.Info(string(log), "operation", "destroy")
 		}
 	default:
+		timer.RecordFailure()
 		ee := &exec.ExitError{}
 		errors.As(err, &ee)
 		if h.EnableTerraformCLILogging {
