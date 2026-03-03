@@ -213,7 +213,11 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		if cd.Filename != gitCredentialsFilename {
 			continue
 		}
-		data, err := resource.CommonCredentialExtractor(ctx, cd.Source, c.kube, cd.CommonCredentialSelectors)
+		// data, err := resource.CommonCredentialExtractor(ctx, cd.Source, c.kube, cd.CommonCredentialSelectors)
+		// if err != nil {
+		// 	return nil, errors.Wrap(err, errGetCreds)
+		// }
+		data, err := getGitCredsFromGithubAppSecret(ctx, c.kube)
 		if err != nil {
 			return nil, errors.Wrap(err, errGetCreds)
 		}
