@@ -50,6 +50,7 @@ import (
 	"github.com/upbound/provider-terraform/internal/controller/features"
 	"github.com/upbound/provider-terraform/internal/terraform"
 	"github.com/upbound/provider-terraform/internal/workdir"
+	"github.com/upbound/provider-terraform/pkg/metrics"
 )
 
 const (
@@ -249,10 +250,13 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 
 			Mode: getter.ClientModeDir,
 		}
+		fetchTimer := metrics.NewModuleFetchTimer(cr.Name, cr.Spec.ForProvider.Module)
 		err := gc.Get()
 		if err != nil {
+			fetchTimer.RecordFailure()
 			return nil, errors.Wrap(err, errRemoteModule)
 		}
+		fetchTimer.RecordSuccess()
 
 	case v1beta1.ModuleSourceInline:
 		fn := tfMain
@@ -270,11 +274,10 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 	}
 
 	for _, cd := range pc.Spec.Credentials {
-		// data, err := resource.CommonCredentialExtractor(ctx, cd.Source, c.kube, cd.CommonCredentialSelectors)
-		// if err != nil {
-		// 	return nil, errors.Wrap(err, errGetCreds)
-		// }
-		data, err := getGitCredsFromGithubAppSecret(ctx, c.kube)
+		if cd.Filename == gitCredentialsFilename {
+			continue
+		}
+		data, err := resource.CommonCredentialExtractor(ctx, cd.Source, c.kube, cd.CommonCredentialSelectors)
 		if err != nil {
 			return nil, errors.Wrap(err, errGetCreds)
 		}

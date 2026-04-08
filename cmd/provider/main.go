@@ -49,6 +49,7 @@ import (
 	"github.com/upbound/provider-terraform/apis/v1beta1"
 	workspace "github.com/upbound/provider-terraform/internal/controller"
 	"github.com/upbound/provider-terraform/internal/controller/features"
+	_ "github.com/upbound/provider-terraform/pkg/metrics"
 )
 
 func main() {

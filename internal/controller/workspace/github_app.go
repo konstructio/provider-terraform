@@ -13,6 +13,8 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/upbound/provider-terraform/pkg/metrics"
 )
 
 // installationTokenResponse represents the GitHub API response for installation token creation.
@@ -84,21 +86,27 @@ func generateInstallationToken(appID, installationID int64, privateKeyPEM string
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", signedJWT))
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+	apiStart := time.Now()
+	resp, err := httpClient.Do(req)
 	if err != nil {
+		metrics.RecordGitHubAPICall("unknown", "generate_installation_token", "failure", time.Since(apiStart))
 		return "", fmt.Errorf("error requesting installation token: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		metrics.RecordGitHubAPICall("unknown", "generate_installation_token", "failure", time.Since(apiStart))
 		return "", fmt.Errorf("error reading installation token response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusCreated {
+		metrics.RecordGitHubAPICall("unknown", "generate_installation_token", "failure", time.Since(apiStart))
 		return "", fmt.Errorf("failed to create installation token (status %d): %s", resp.StatusCode, string(body))
 	}
+
+	metrics.RecordGitHubAPICall("unknown", "generate_installation_token", "success", time.Since(apiStart))
 
 	var tokenResp installationTokenResponse
 	if err := json.Unmarshal(body, &tokenResp); err != nil {
