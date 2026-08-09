@@ -20,6 +20,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	stdruntime "runtime"
 	"testing"
 
 	xpv2 "github.com/crossplane/crossplane-runtime/v2/apis/common/v2"
@@ -117,6 +118,27 @@ func (tf *MockTf) Destroy(ctx context.Context, o ...terraform.Option) error {
 
 func (tf *MockTf) DeleteCurrentWorkspace(ctx context.Context) error {
 	return tf.MockDeleteCurrentWorkspace(ctx)
+}
+
+// memFsWithProviders returns an in-memory fs pre-populated with a terraform
+// dependency lock file and a matching installed provider plugin under dir, so
+// that terraform.ProvidersInstalled reports the plugins as present (allowing a
+// checksum match to skip terraform init).
+func memFsWithProviders(t *testing.T, dir string) afero.Afero {
+	t.Helper()
+	fs := afero.Afero{Fs: afero.NewMemMapFs()}
+	lock := "provider \"registry.terraform.io/hashicorp/null\" {\n  version = \"3.2.1\"\n}\n"
+	if err := fs.WriteFile(filepath.Join(dir, ".terraform.lock.hcl"), []byte(lock), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pdir := filepath.Join(dir, ".terraform", "providers", "registry.terraform.io", "hashicorp", "null", "3.2.1", stdruntime.GOOS+"_"+stdruntime.GOARCH)
+	if err := fs.MkdirAll(pdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.WriteFile(filepath.Join(pdir, "terraform-provider-null"), []byte("bin"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return fs
 }
 
 func TestConnect(t *testing.T) {
@@ -809,7 +831,53 @@ func TestConnect(t *testing.T) {
 			want: errors.Wrap(errBoom, errChecksum),
 		},
 		"ChecksumMatches": {
-			reason: "We should return any error when generating the workspace checksum",
+			reason: "We should skip terraform init when the checksum matches and the provider plugins are installed",
+			fields: fields{kube: &test.MockClient{
+				MockGet: test.NewMockGetFn(nil),
+				MockScheme: func() *runtime.Scheme {
+					s := runtime.NewScheme()
+					if err := namespaced.AddToScheme(s); err != nil {
+						t.Fatal(err)
+					}
+					return s
+				},
+			},
+				usage: tfClient.ModernTrackerFn(func(_ context.Context, _ resource.ModernManaged) error { return nil }),
+				fs:    memFsWithProviders(t, filepath.Join(tfDir, string(uid))),
+				terraform: func(_ string, _ bool, _ bool, _ logging.Logger, _ ...string) tfclient {
+					// No MockInit: if init were called the test would panic,
+					// proving init is skipped when the plugins are present.
+					return &MockTf{
+						MockGenerateChecksum: func(ctx context.Context) (string, error) { return tfChecksum, nil },
+						MockWorkspace:        func(_ context.Context, _ string) error { return nil },
+					}
+				},
+			},
+			args: args{
+				mg: &v1beta1.Workspace{
+					ObjectMeta: metav1.ObjectMeta{UID: uid},
+					Spec: v1beta1.WorkspaceSpec{
+						ManagedResourceSpec: xpv2.ManagedResourceSpec{
+							ProviderConfigReference: &xpv1.ProviderConfigReference{
+								Kind: "ClusterProviderConfig",
+							},
+						},
+						ForProvider: v1beta1.WorkspaceParameters{
+							Module: "I'm HCL!",
+							Source: v1beta1.ModuleSourceInline,
+						},
+					},
+					Status: v1beta1.WorkspaceStatus{
+						AtProvider: v1beta1.WorkspaceObservation{
+							Checksum: tfChecksum,
+						},
+					},
+				},
+			},
+			want: nil,
+		},
+		"ChecksumMatchesButPluginsMissing": {
+			reason: "We should still run terraform init when the checksum matches but the provider plugins are missing from disk",
 			fields: fields{kube: &test.MockClient{
 				MockGet: test.NewMockGetFn(nil),
 				MockScheme: func() *runtime.Scheme {
@@ -823,8 +891,12 @@ func TestConnect(t *testing.T) {
 				usage: tfClient.ModernTrackerFn(func(_ context.Context, _ resource.ModernManaged) error { return nil }),
 				fs:    afero.Afero{Fs: afero.NewMemMapFs()},
 				terraform: func(_ string, _ bool, _ bool, _ logging.Logger, _ ...string) tfclient {
+					// Empty fs => no plugins installed. Init MUST run; if it
+					// didn't, MockWorkspace alone would leave this passing while
+					// production apply/destroy failed opaquely.
 					return &MockTf{
 						MockGenerateChecksum: func(ctx context.Context) (string, error) { return tfChecksum, nil },
+						MockInit:             func(_ context.Context, _ ...terraform.InitOption) error { return nil },
 						MockWorkspace:        func(_ context.Context, _ string) error { return nil },
 					}
 				},

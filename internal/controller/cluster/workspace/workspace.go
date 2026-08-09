@@ -355,11 +355,15 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		if err != nil {
 			return nil, errors.Wrap(err, errChecksum)
 		}
-		if cr.Status.AtProvider.Checksum == checksum {
-			l.Debug("Checksums match - skip running terraform init")
+		if cr.Status.AtProvider.Checksum == checksum && terraform.ProvidersInstalled(c.fs, dir) {
+			l.Debug("Checksums match and provider plugins present - skip running terraform init")
 			return &external{tf: tf, kube: c.kube, logger: c.logger}, errors.Wrap(tf.Workspace(ctx, meta.GetExternalName(cr)), errWorkspace)
 		}
-		l.Debug("Checksums don't match so run terraform init:", "old", cr.Status.AtProvider.Checksum, "new", checksum)
+		if cr.Status.AtProvider.Checksum == checksum {
+			l.Debug("Checksums match but provider plugins missing - running terraform init")
+		} else {
+			l.Debug("Checksums don't match so run terraform init:", "old", cr.Status.AtProvider.Checksum, "new", checksum)
+		}
 	}
 
 	o := make([]terraform.InitOption, 0, len(cr.Spec.ForProvider.InitArgs))

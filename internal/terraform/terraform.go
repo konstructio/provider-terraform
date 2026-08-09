@@ -29,6 +29,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,6 +38,7 @@ import (
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
 	"github.com/pkg/errors"
+	"github.com/spf13/afero"
 )
 
 // Error strings.
@@ -97,17 +99,61 @@ func formatTerraformErrorOutput(errorOutput string) (string, string, error) {
 		return "", "", err
 	}
 
-	// Return the first line of the error output as the summary
+	// Return the first "Error: ..." line as the summary. Not every terraform
+	// failure emits that pattern (e.g. a missing provider plugin), so fall back
+	// to the last non-empty line rather than reporting an empty "Summary: .".
 	var summary string
-	lines := strings.Split(errorOutput, "\n")
-	if m := tfError.FindSubmatch([]byte(errorOutput)); len(lines) > 0 && len(m) > 1 {
+	if m := tfError.FindSubmatch([]byte(errorOutput)); len(m) > 1 {
 		summary = string(m[1])
+	}
+	if summary == "" {
+		lines := strings.Split(errorOutput, "\n")
+		for i := len(lines) - 1; i >= 0; i-- {
+			if s := strings.TrimSpace(lines[i]); s != "" {
+				summary = s
+				break
+			}
+		}
 	}
 
 	// base64FullErr := base64.StdEncoding.EncodeToString([]byte(errorOutput))
 	base64FullErr := base64.StdEncoding.EncodeToString(buffer.Bytes())
 
 	return summary, base64FullErr, nil
+}
+
+// providerBlock matches each provider entry in a terraform dependency lock file
+// (.terraform.lock.hcl), capturing the provider source address and its version.
+var providerBlock = regexp.MustCompile(`provider\s+"([^"]+)"\s*\{[^}]*?version\s*=\s*"([^"]+)"`)
+
+// ProvidersInstalled reports whether every provider plugin pinned in dir's
+// dependency lock file is actually present under .terraform/providers for the
+// current platform.
+//
+// A matching module checksum is not enough to safely skip `terraform init`: the
+// checksum is stored on the Workspace's status and survives provider Pod
+// restarts, but the plugins live on the Pod's ephemeral disk. After a restart or
+// a recreated working directory the plugins can be missing, and apply/destroy
+// then fails opaquely with "could not read package directory". Callers use this
+// to force a re-init whenever the plugins aren't on disk.
+func ProvidersInstalled(fs afero.Fs, dir string) bool {
+	lock, err := afero.ReadFile(fs, filepath.Join(dir, ".terraform.lock.hcl"))
+	if err != nil {
+		return false
+	}
+	matches := providerBlock.FindAllStringSubmatch(string(lock), -1)
+	if len(matches) == 0 {
+		return false
+	}
+	platform := runtime.GOOS + "_" + runtime.GOARCH
+	for _, m := range matches {
+		source, version := m[1], m[2]
+		entries, err := afero.ReadDir(fs, filepath.Join(dir, ".terraform", "providers", filepath.FromSlash(source), version, platform))
+		if err != nil || len(entries) == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // NOTE(negz): The gosec linter returns a G204 warning anytime a command is
@@ -705,6 +751,14 @@ func runCommand(ctx context.Context, c *exec.Cmd) ([]byte, error) {
 		}
 		return nil, errors.Wrap(err, errRunCommand)
 	case res := <-ch:
+		// c.Output() records the command's stderr on the *exec.ExitError, but
+		// terraform frequently prints the actual failure (e.g. a missing provider
+		// plugin) to stdout. When stderr is empty, fold stdout into the error so
+		// Classify surfaces something actionable instead of an empty summary.
+		var ee *exec.ExitError
+		if errors.As(res.err, &ee) && len(ee.Stderr) == 0 && len(res.out) > 0 {
+			ee.Stderr = res.out
+		}
 		return res.out, res.err
 	}
 }
