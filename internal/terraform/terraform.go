@@ -771,13 +771,19 @@ func runCommand(ctx context.Context, c *exec.Cmd) ([]byte, error) {
 
 // runCommand executes the requested command and sends the process SIGTERM if the context finishes before the command
 func runCommandv2(ctx context.Context, c *exec.Cmd, f io.Writer) ([]byte, error) {
+	// Tee terraform's combined output into a buffer as well as the log writer.
+	// c.Run() streams stderr to the writer instead of capturing it on the
+	// ExitError, so without this a non-zero exit leaves Classify with an empty
+	// "Summary: ." — the fold below uses the buffer to surface the real error.
+	var buf bytes.Buffer
+	w := io.MultiWriter(f, &buf)
 	ch := make(chan cmdResult, 1)
 	go func() {
 		defer close(ch)
-		c.Stderr = f
-		c.Stdout = f
+		c.Stderr = w
+		c.Stdout = w
 		e := c.Run()
-		ch <- cmdResult{err: e}
+		ch <- cmdResult{out: buf.Bytes(), err: e}
 	}()
 	select {
 	case <-ctx.Done():
