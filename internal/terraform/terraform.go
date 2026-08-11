@@ -36,7 +36,7 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/crossplane/crossplane-runtime/pkg/logging"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
 	"github.com/pkg/errors"
 
 	"github.com/upbound/provider-terraform/pkg/metrics"
@@ -187,7 +187,7 @@ var rwmutex = &sync.RWMutex{}
 // Init initializes a Terraform configuration.
 func (h Harness) Init(ctx context.Context, o ...InitOption) error {
 	args := append([]string{"init", "-input=false", "-no-color"}, InitArgsToString(o)...)
-	cmd := exec.Command(h.Path, args...) //nolint:gosec
+	cmd := exec.CommandContext(ctx, h.Path, args...) //nolint:gosec
 	cmd.Dir = h.Dir
 	for _, e := range os.Environ() {
 		if strings.Contains(e, "TF_PLUGIN_CACHE_DIR") {
@@ -222,7 +222,7 @@ func (h Harness) Init(ctx context.Context, o ...InitOption) error {
 // but isn't is deemed invalid. Attempts to initialise an invalid configuration
 // will result in errors, which are not available in a machine readable format.
 func (h Harness) Validate(ctx context.Context) error {
-	cmd := exec.Command(h.Path, "validate", "-json") //nolint:gosec
+	cmd := exec.CommandContext(ctx, h.Path, "validate", "-json") //nolint:gosec
 	cmd.Dir = h.Dir
 	if len(h.Envs) > 0 {
 		cmd.Env = append(os.Environ(), h.Envs...)
@@ -257,7 +257,7 @@ func (h Harness) Validate(ctx context.Context) error {
 // Workspace selects the named Terraform workspace. The workspace will be
 // created if it does not exist.
 func (h Harness) Workspace(ctx context.Context, name string) error {
-	cmd := exec.Command(h.Path, "workspace", "select", "-no-color", name) //nolint:gosec
+	cmd := exec.CommandContext(ctx, h.Path, "workspace", "select", "-no-color", name) //nolint:gosec
 	cmd.Dir = h.Dir
 	if len(h.Envs) > 0 {
 		cmd.Env = append(os.Environ(), h.Envs...)
@@ -271,8 +271,11 @@ func (h Harness) Workspace(ctx context.Context, name string) error {
 	// We weren't able to select a workspace. We assume this was because the
 	// workspace doesn't exist, which causes Terraform to return non-zero. This
 	// is somewhat optimistic, but it shouldn't hurt to try.
-	cmd = exec.Command(h.Path, "workspace", "new", "-no-color", name) //nolint:gosec
+	cmd = exec.CommandContext(ctx, h.Path, "workspace", "new", "-no-color", name) //nolint:gosec
 	cmd.Dir = h.Dir
+	if len(h.Envs) > 0 {
+		cmd.Env = append(os.Environ(), h.Envs...)
+	}
 
 	if h.UsePluginCache {
 		rwmutex.RLock()
@@ -285,7 +288,7 @@ func (h Harness) Workspace(ctx context.Context, name string) error {
 
 // DeleteCurrentWorkspace deletes the current Terraform workspace if it is not the default.
 func (h Harness) DeleteCurrentWorkspace(ctx context.Context) error {
-	cmd := exec.Command(h.Path, "workspace", "show", "-no-color") //nolint:gosec
+	cmd := exec.CommandContext(ctx, h.Path, "workspace", "show", "-no-color") //nolint:gosec
 	cmd.Dir = h.Dir
 	if len(h.Envs) > 0 {
 		cmd.Env = append(os.Environ(), h.Envs...)
@@ -305,7 +308,7 @@ func (h Harness) DeleteCurrentWorkspace(ctx context.Context) error {
 	if err != nil {
 		return Classify(err)
 	}
-	cmd = exec.Command(h.Path, "workspace", "delete", "-no-color", name) //nolint:gosec
+	cmd = exec.CommandContext(ctx, h.Path, "workspace", "delete", "-no-color", name) //nolint:gosec
 	cmd.Dir = h.Dir
 	if len(h.Envs) > 0 {
 		cmd.Env = append(os.Environ(), h.Envs...)
@@ -328,7 +331,7 @@ func (h Harness) DeleteCurrentWorkspace(ctx context.Context) error {
 // GenerateChecksum calculates the md5sum of the workspace (excluding installed providers) to see if terraform init needs to run
 func (h Harness) GenerateChecksum(ctx context.Context) (string, error) {
 	command := "/usr/bin/find . -path ./.git -prune -o -path ./.terraform/providers -prune -o -type f -exec /usr/bin/md5sum {} + | LC_ALL=C /usr/bin/sort | /usr/bin/md5sum | /usr/bin/awk '{print $1}'"
-	cmd := exec.Command("/bin/sh", "-c", command) //nolint:gosec
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command) //nolint:gosec
 	cmd.Dir = h.Dir
 
 	checksum, err := runCommand(ctx, cmd)
@@ -415,7 +418,7 @@ func (o Output) JSONValue() ([]byte, error) {
 
 // Outputs extracts outputs from Terraform state.
 func (h Harness) Outputs(ctx context.Context) ([]Output, error) {
-	cmd := exec.Command(h.Path, "output", "-json") //nolint:gosec
+	cmd := exec.CommandContext(ctx, h.Path, "output", "-json") //nolint:gosec
 	cmd.Dir = h.Dir
 	if len(h.Envs) > 0 {
 		cmd.Env = append(os.Environ(), h.Envs...)
@@ -475,7 +478,7 @@ func (h Harness) Outputs(ctx context.Context) ([]Output, error) {
 
 // Resources returns a list of resources in the Terraform state.
 func (h Harness) Resources(ctx context.Context) ([]string, error) {
-	cmd := exec.Command(h.Path, "state", "list") //nolint:gosec
+	cmd := exec.CommandContext(ctx, h.Path, "state", "list") //nolint:gosec
 	cmd.Dir = h.Dir
 	if len(h.Envs) > 0 {
 		cmd.Env = append(os.Environ(), h.Envs...)
@@ -561,7 +564,7 @@ func (h Harness) Diff(ctx context.Context, o ...Option) (bool, error) {
 	}
 
 	args := append([]string{"plan", "-no-color", "-input=false", "-detailed-exitcode", "-lock=false"}, ao.args...)
-	cmd := exec.Command(h.Path, args...) //nolint:gosec
+	cmd := exec.CommandContext(ctx, h.Path, args...) //nolint:gosec
 	cmd.Dir = h.Dir
 	if len(h.Envs) > 0 {
 		cmd.Env = append(os.Environ(), h.Envs...)
@@ -611,7 +614,7 @@ func (h Harness) Apply(ctx context.Context, ws string, o ...Option) error {
 	}
 
 	args := append([]string{"apply", "-no-color", "-auto-approve", "-input=false"}, ao.args...)
-	cmd := exec.Command(h.Path, args...) //nolint:gosec
+	cmd := exec.CommandContext(ctx, h.Path, args...) //nolint:gosec
 	cmd.Dir = h.Dir
 	if len(h.Envs) > 0 {
 		cmd.Env = append(os.Environ(), h.Envs...)
@@ -663,7 +666,7 @@ func (h Harness) Destroy(ctx context.Context, ws string, o ...Option) error {
 	}
 
 	args := append([]string{"destroy", "-no-color", "-auto-approve", "-input=false"}, do.args...)
-	cmd := exec.Command(h.Path, args...) //nolint:gosec
+	cmd := exec.CommandContext(ctx, h.Path, args...) //nolint:gosec
 	cmd.Dir = h.Dir
 	if len(h.Envs) > 0 {
 		cmd.Env = append(os.Environ(), h.Envs...)

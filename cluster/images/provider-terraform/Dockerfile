@@ -1,9 +1,9 @@
-FROM alpine:3.21.3
+FROM alpine:3.23.3
 RUN apk --no-cache add ca-certificates bash git curl
 ARG TARGETOS
 ARG TARGETARCH
 
-ENV TERRAFORM_VERSION=1.5.5
+ENV TERRAFORM_VERSION=1.5.7
 ENV TF_IN_AUTOMATION=1
 ENV TF_PLUGIN_CACHE_DIR=/tf/plugin-cache
 
