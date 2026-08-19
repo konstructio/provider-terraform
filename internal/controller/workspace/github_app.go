@@ -48,7 +48,7 @@ func getGitCredsFromGithubAppSecret(ctx context.Context, client client.Client) (
 
 	installationToken, err := generateInstallationToken(appID, installationID, privateKeyPEM)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get installation token: %w", &err)
+		return nil, fmt.Errorf("failed to get installation token: %w", err)
 	}
 
 	data := fmt.Sprintf("https://x-access-token:%s@github.com", installationToken)
