@@ -214,13 +214,19 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		if cd.Filename != gitCredentialsFilename {
 			continue
 		}
-		// data, err := resource.CommonCredentialExtractor(ctx, cd.Source, c.kube, cd.CommonCredentialSelectors)
-		// if err != nil {
-		// 	return nil, errors.Wrap(err, errGetCreds)
-		// }
+		// Prefer GitHub App minted credentials when the github-app secret is
+		// present (SaaS installs); otherwise fall back to the credential source
+		// configured on the ProviderConfig. Hard-requiring the GitHub App
+		// secret breaks every GitLab-based install: Connect fails with
+		// "failed to get github app credentials secret" even for public module
+		// sources that need no git credentials at all.
 		data, err := getGitCredsFromGithubAppSecret(ctx, c.kube)
 		if err != nil {
-			return nil, errors.Wrap(err, errGetCreds)
+			var fallbackErr error
+			data, fallbackErr = resource.CommonCredentialExtractor(ctx, cd.Source, c.kube, cd.CommonCredentialSelectors)
+			if fallbackErr != nil {
+				return nil, errors.Wrap(fallbackErr, errGetCreds+" (github app secret also unavailable: "+err.Error()+")")
+			}
 		}
 
 		// NOTE(bobh66): Put the git credentials file in /tmp/tf/<UUID> so it doesn't get removed or overwritten
