@@ -3,8 +3,31 @@ FROM alpine
 RUN apk add --no-cache curl unzip bash git
 
 # Terraform version
-ARG TERRAFORM_VERSION=1.5.7
+ARG TERRAFORM_VERSION=1.14.9
 ARG TARGETARCH
+
+# --- bake kubectl provider + CLI config ---
+ARG KUBECTL_PROVIDER_NAMESPACE=gavinbunney
+ARG KUBECTL_PROVIDER_VERSION=1.19.0
+
+RUN mkdir -p /plugins/registry.terraform.io/${KUBECTL_PROVIDER_NAMESPACE}/kubectl \
+ && curl -fsSL \
+    -o /plugins/registry.terraform.io/${KUBECTL_PROVIDER_NAMESPACE}/kubectl/terraform-provider-kubectl_${KUBECTL_PROVIDER_VERSION}_linux_${TARGETARCH}.zip \
+    https://github.com/${KUBECTL_PROVIDER_NAMESPACE}/terraform-provider-kubectl/releases/download/v${KUBECTL_PROVIDER_VERSION}/terraform-provider-kubectl_${KUBECTL_PROVIDER_VERSION}_linux_${TARGETARCH}.zip
+
+COPY <<'EOF' /etc/terraformrc
+provider_installation {
+  filesystem_mirror {
+    path    = "/plugins"
+    include = ["registry.terraform.io/gavinbunney/kubectl"]
+  }
+  direct {
+    exclude = ["registry.terraform.io/gavinbunney/kubectl"]
+  }
+}
+EOF
+
+ENV TF_CLI_CONFIG_FILE=/etc/terraformrc
 
 # Download correct binary depending on architecture
 RUN curl -fsSL -o /tmp/terraform.zip \

@@ -20,4 +20,4 @@ cover.out
 
 # common credentials
 kubeconfig
-credentials.json
+credentials.json/manager

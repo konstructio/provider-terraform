@@ -10,31 +10,38 @@ PLATFORMS ?= linux_amd64 linux_arm64
 -include build/makelib/output.mk
 
 # Setup Go
+GO_REQUIRED_VERSION ?= 1.24
 NPROCS ?= 1
-# GOLANGCILINT_VERSION is inherited from build submodule by default.
-# Uncomment below if you need to override the version.
-# GOLANGCILINT_VERSION ?= 1.50.0
+GOLANGCILINT_VERSION = 2.13.1
 GO_TEST_PARALLEL := $(shell echo $$(( $(NPROCS) / 2 )))
 GO_STATIC_PACKAGES = $(GO_PROJECT)/cmd/provider
 GO_LDFLAGS += -X $(GO_PROJECT)/pkg/version.Version=$(VERSION)
-GO_SUBDIRS += cmd internal apis
+GO_SUBDIRS += cmd internal apis generate
 GO111MODULE = on
+
 -include build/makelib/golang.mk
 
 # ====================================================================================
 # Setup Kubernetes tools
 
-# Uncomment below to override the versions from the build module
-# KIND_VERSION = v0.15.0
-UP_VERSION = v0.28.0
-# UP_CHANNEL = stable
-UPTEST_VERSION = v0.5.0
-CROSSPLANE_VERSION = 1.16.0
+KIND_VERSION = v0.32.0
+UPTEST_VERSION = v2.2.0
+KUSTOMIZE_VERSION = v5.3.0
+YQ_VERSION = v4.40.5
+CRDDIFF_VERSION = v0.12.1
+CROSSPLANE_VERSION = 2.0.2
+CROSSPLANE_CLI_VERSION = v2.0.2
+
+export CROSSPLANE_CLI_VERSION := $(CROSSPLANE_CLI_VERSION)
+
 -include build/makelib/k8s_tools.mk
 
 # Setup Images
 REGISTRY_ORGS ?= xpkg.upbound.io/upbound
 IMAGES = provider-terraform
+BATCH_PLATFORMS ?= linux_amd64,linux_arm64
+export BATCH_PLATFORMS := $(BATCH_PLATFORMS)
+
 -include build/makelib/imagelight.mk
 
 # ====================================================================================
@@ -73,7 +80,7 @@ xpkg.build.provider-terraform: do.build.images
 # NOTE(hasheddan): we must ensure up is installed in tool cache prior to build
 # as including the k8s_tools machinery prior to the xpkg machinery sets UP to
 # point to tool cache.
-build.init: $(UP)
+build.init: $(CROSSPLANE_CLI)
 
 # This is for running out-of-cluster locally, and is for convenience. Running
 # this make target will print out the command which was used. For more control,
@@ -90,7 +97,7 @@ dev: $(KIND) $(KUBECTL)
 	@$(KIND) create cluster --name=$(PROJECT_NAME)-dev
 	@$(KUBECTL) cluster-info --context kind-$(PROJECT_NAME)-dev
 	@$(INFO) Installing Crossplane CRDs
-	@$(KUBECTL) apply -k https://github.com/crossplane/crossplane//cluster?ref=master
+	@$(KUBECTL) apply -k https://github.com/crossplane/crossplane/cluster?ref=master
 	@$(INFO) Installing Provider CRDs
 	@$(KUBECTL) apply -R -f package/crds
 	@$(INFO) Starting Provider controllers
@@ -112,9 +119,9 @@ CROSSPLANE_NAMESPACE = upbound-system
 # - UPTEST_EXAMPLE_LIST, a comma-separated list of examples to test
 # - UPTEST_CLOUD_CREDENTIALS (optional), cloud credentials for the provider being tested, e.g. export UPTEST_CLOUD_CREDENTIALS=$(cat ~/.aws/credentials)
 # - UPTEST_DATASOURCE_PATH (optional), see https://github.com/upbound/uptest#injecting-dynamic-values-and-datasource
-uptest: $(UPTEST) $(KUBECTL) $(KUTTL)
+uptest: $(UPTEST) $(KUBECTL) $(CHAINSAW) $(CROSSPLANE_CLI)
 	@$(INFO) running automated tests
-	@KUBECTL=$(KUBECTL) KUTTL=$(KUTTL) $(UPTEST) e2e "${UPTEST_EXAMPLE_LIST}" --data-source="${UPTEST_DATASOURCE_PATH}" --setup-script=cluster/test/setup.sh || $(FAIL)
+	@KUBECTL=$(KUBECTL) CHAINSAW=$(CHAINSAW) CROSSPLANE_CLI=$(CROSSPLANE_CLI) CROSSPLANE_NAMESPACE=$(CROSSPLANE_NAMESPACE) $(UPTEST) e2e "${UPTEST_EXAMPLE_LIST}" --data-source="${UPTEST_DATASOURCE_PATH}" --setup-script=cluster/test/setup.sh --skip-import || $(FAIL)
 	@$(OK) running automated tests
 
 local-deploy: build controlplane.up local.xpkg.deploy.provider.$(PROJECT_NAME)
@@ -131,7 +138,7 @@ e2e: local-deploy uptest
 
 # TODO: please move this to the common build submodule
 # once the use cases mature
-crddiff: $(UPTEST)
+crddiff:
 	@$(INFO) Checking breaking CRD schema changes
 	@for crd in $${MODIFIED_CRD_LIST}; do \
 		if ! git cat-file -e "$${GITHUB_BASE_REF}:$${crd}" 2>/dev/null; then \
@@ -139,7 +146,7 @@ crddiff: $(UPTEST)
 			continue ; \
 		fi ; \
 		echo "Checking $${crd} for breaking API changes..." ; \
-		changes_detected=$$($(UPTEST) crddiff revision <(git cat-file -p "$${GITHUB_BASE_REF}:$${crd}") "$${crd}" 2>&1) ; \
+		changes_detected=$$(go run github.com/upbound/uptest/cmd/crddiff@$(CRDDIFF_VERSION) revision <(git cat-file -p "$${GITHUB_BASE_REF}:$${crd}") "$${crd}" 2>&1) ; \
 		if [[ $$? != 0 ]] ; then \
 			printf "\033[31m"; echo "Breaking change detected!"; printf "\033[0m" ; \
 			echo "$${changes_detected}" ; \
