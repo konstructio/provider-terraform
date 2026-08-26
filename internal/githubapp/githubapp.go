@@ -47,7 +47,7 @@ func GetGitCredsFromGithubAppSecret(ctx context.Context, client client.Client) (
 		return nil, fmt.Errorf("failed to parse installation_id from secret: %w", err)
 	}
 
-	installationToken, err := generateInstallationToken(appID, installationID, privateKeyPEM)
+	installationToken, err := generateInstallationToken(ctx, appID, installationID, privateKeyPEM)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get installation token: %w", err)
 	}
@@ -57,7 +57,7 @@ func GetGitCredsFromGithubAppSecret(ctx context.Context, client client.Client) (
 	return []byte(data), nil
 }
 
-func generateInstallationToken(appID, installationID int64, privateKeyPEM string) (string, error) {
+func generateInstallationToken(ctx context.Context, appID, installationID int64, privateKeyPEM string) (string, error) {
 	// Parse the RSA private key from PEM
 	key, err := jwt.ParseRSAPrivateKeyFromPEM([]byte(privateKeyPEM))
 	if err != nil {
@@ -79,7 +79,7 @@ func generateInstallationToken(appID, installationID int64, privateKeyPEM string
 
 	// Exchange JWT for installation access token
 	url := fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", installationID)
-	req, err := http.NewRequest(http.MethodPost, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
 	if err != nil {
 		return "", fmt.Errorf("error creating installation token request: %w", err)
 	}
@@ -94,7 +94,7 @@ func generateInstallationToken(appID, installationID int64, privateKeyPEM string
 		metrics.RecordGitHubAPICall("unknown", "generate_installation_token", "failure", time.Since(apiStart))
 		return "", fmt.Errorf("error requesting installation token: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

@@ -628,11 +628,11 @@ func (h Harness) Apply(ctx context.Context, ws string, o ...Option) error {
 	// In case of terraform apply
 	// 0 - Succeeded
 	// Non Zero output - Errored
-	f, err := os.Create(filepath.Join("/logs", ws))
+	f, err := createLogFile(ws)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	timer := metrics.NewTerraformOperationTimer(filepath.Base(h.Dir), "apply")
 	log, err := runCommandv2(ctx, cmd, f)
 	switch cmd.ProcessState.ExitCode() {
@@ -676,11 +676,11 @@ func (h Harness) Destroy(ctx context.Context, ws string, o ...Option) error {
 		rwmutex.RLock()
 		defer rwmutex.RUnlock()
 	}
-	f, err := os.Create(filepath.Join("/logs", ws))
+	f, err := createLogFile(ws)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	timer := metrics.NewTerraformOperationTimer(filepath.Base(h.Dir), "destroy")
 	log, err := runCommandv2(ctx, cmd, f)
 
@@ -737,7 +737,21 @@ func runCommand(ctx context.Context, c *exec.Cmd) ([]byte, error) {
 	}
 }
 
-// runCommand executes the requested command and sends the process SIGTERM if the context finishes before the command
+// logDir is where terraform apply/destroy output is captured, one file per workspace.
+const logDir = "/logs"
+
+// createLogFile opens the capture file for a workspace. The name is reduced to
+// its base component so a workspace name can never escape logDir.
+func createLogFile(ws string) (*os.File, error) {
+	name := filepath.Base(filepath.Clean(ws))
+	if name == "." || name == string(filepath.Separator) {
+		return nil, errors.New("invalid workspace name for log file")
+	}
+	return os.Create(filepath.Join(logDir, name)) //nolint:gosec // path is constrained to logDir/<base>
+}
+
+// runCommandv2 executes the requested command, streaming stdout/stderr to f, and sends the process SIGTERM if the
+// context finishes before the command.
 func runCommandv2(ctx context.Context, c *exec.Cmd, f io.Writer) ([]byte, error) {
 	ch := make(chan cmdResult, 1)
 	go func() {
