@@ -48,7 +48,9 @@ import (
 	"github.com/upbound/provider-terraform/apis/cluster/v1beta1"
 	tfClient "github.com/upbound/provider-terraform/internal/clients"
 	"github.com/upbound/provider-terraform/internal/features"
+	"github.com/upbound/provider-terraform/internal/githubapp"
 	"github.com/upbound/provider-terraform/internal/terraform"
+	"github.com/upbound/provider-terraform/pkg/metrics"
 
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
 	sourcev1beta2 "github.com/fluxcd/source-controller/api/v1beta2"
@@ -115,8 +117,8 @@ type tfclient interface {
 	Outputs(ctx context.Context) ([]terraform.Output, error)
 	Resources(ctx context.Context) ([]string, error)
 	Diff(ctx context.Context, o ...terraform.Option) (bool, error)
-	Apply(ctx context.Context, o ...terraform.Option) error
-	Destroy(ctx context.Context, o ...terraform.Option) error
+	Apply(ctx context.Context, ws string, o ...terraform.Option) error
+	Destroy(ctx context.Context, ws string, o ...terraform.Option) error
 	DeleteCurrentWorkspace(ctx context.Context) error
 	GenerateChecksum(ctx context.Context) (string, error)
 }
@@ -134,6 +136,7 @@ func Setup(mgr ctrl.Manager, o controller.Options, timeout, pollJitter time.Dura
 		terraform: func(dir string, usePluginCache bool, enableTerraformCLILogging bool, logger logging.Logger, envs ...string) tfclient {
 			return terraform.Harness{Path: tfPath, Dir: dir, UsePluginCache: usePluginCache, EnableTerraformCLILogging: enableTerraformCLILogging, Logger: logger, Envs: envs}
 		},
+		gitCreds: githubapp.GetGitCredsFromGithubAppSecret,
 	}
 
 	opts := []managed.ReconcilerOption{
@@ -184,6 +187,9 @@ type connector struct {
 	logger    logging.Logger
 	fs        afero.Afero
 	terraform func(dir string, usePluginCache bool, enableTerraformCLILogging bool, logger logging.Logger, envs ...string) tfclient
+	// gitCreds returns the contents of the .git-credentials file. It defaults to
+	// minting a token from a GitHub App installation; tests may override it.
+	gitCreds func(ctx context.Context, kube client.Client) ([]byte, error)
 }
 
 func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.ExternalClient, error) { //nolint:gocyclo
@@ -216,7 +222,13 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		if cd.Filename != gitCredentialsFilename {
 			continue
 		}
-		data, err := resource.CommonCredentialExtractor(ctx, cd.Source, c.kube, cd.CommonCredentialSelectors)
+		// NOTE(konstruct): git credentials are minted from a GitHub App installation
+		// instead of being read from the ProviderConfig credential source.
+		gitCreds := c.gitCreds
+		if gitCreds == nil {
+			gitCreds = githubapp.GetGitCredsFromGithubAppSecret
+		}
+		data, err := gitCreds(ctx, c.kube)
 		if err != nil {
 			return nil, errors.Wrap(err, errGetCreds)
 		}
@@ -291,10 +303,13 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 				Pwd:  dir,
 				Mode: getter.ClientModeDir,
 			}
+			fetchTimer := metrics.NewModuleFetchTimer(cr.Name, cr.Spec.ForProvider.Module)
 			err := gc.Get()
 			if err != nil {
+				fetchTimer.RecordFailure()
 				return nil, errors.Wrap(err, errRemoteModule)
 			}
+			fetchTimer.RecordSuccess()
 
 			// Update status with downloaded module URL
 			cr.Status.AtProvider.RemoteSource = cr.Spec.ForProvider.Module
@@ -353,10 +368,13 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 				Pwd:  dir,
 				Mode: getter.ClientModeDir,
 			}
+			fetchTimer := metrics.NewModuleFetchTimer(cr.Name, url)
 			err = gc.Get()
 			if err != nil {
+				fetchTimer.RecordFailure()
 				return nil, errors.Wrap(err, errFluxArtefactModule)
 			}
+			fetchTimer.RecordSuccess()
 
 			cr.Status.AtProvider.RemoteSource = url
 			l.Debug("Flux module downloaded", "url", url)
@@ -369,6 +387,9 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 	}
 
 	for _, cd := range pc.Spec.Credentials {
+		if cd.Filename == gitCredentialsFilename {
+			continue
+		}
 		data, err := resource.CommonCredentialExtractor(ctx, cd.Source, c.kube, cd.CommonCredentialSelectors)
 		if err != nil {
 			return nil, errors.Wrap(err, errGetCreds)
@@ -589,7 +610,7 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 	}
 
 	o = append(o, terraform.WithArgs(cr.Spec.ForProvider.ApplyArgs))
-	if err := c.tf.Apply(ctx, o...); err != nil {
+	if err := c.tf.Apply(ctx, cr.Name, o...); err != nil {
 		return managed.ExternalUpdate{}, errors.Wrap(err, errApply)
 	}
 
@@ -629,7 +650,7 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) (managed.Ext
 	}
 
 	o = append(o, terraform.WithArgs(cr.Spec.ForProvider.DestroyArgs))
-	return managed.ExternalDelete{}, errors.Wrap(c.tf.Destroy(ctx, o...), errDestroy)
+	return managed.ExternalDelete{}, errors.Wrap(c.tf.Destroy(ctx, cr.Name, o...), errDestroy)
 }
 
 func (c *external) Disconnect(ctx context.Context) error {

@@ -25,6 +25,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,6 +38,8 @@ import (
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
 	"github.com/pkg/errors"
+
+	"github.com/upbound/provider-terraform/pkg/metrics"
 )
 
 // Error strings.
@@ -204,8 +207,14 @@ func (h Harness) Init(ctx context.Context, o ...InitOption) error {
 		defer rwmutex.Unlock()
 	}
 
+	timer := metrics.NewTerraformOperationTimer(filepath.Base(h.Dir), "init")
 	_, err := runCommand(ctx, cmd)
-	return Classify(err)
+	if err != nil {
+		timer.RecordFailure()
+		return Classify(err)
+	}
+	timer.RecordSuccess()
+	return nil
 }
 
 // Validate a Terraform configuration. Note that there may be interplay between
@@ -569,25 +578,30 @@ func (h Harness) Diff(ctx context.Context, o ...Option) (bool, error) {
 	// 0 - Succeeded, diff is empty (no changes)
 	// 1 - Errored
 	// 2 - Succeeded, there is a diff
+	timer := metrics.NewTerraformOperationTimer(filepath.Base(h.Dir), "plan")
 	log, err := runCommand(ctx, cmd)
 	switch cmd.ProcessState.ExitCode() {
 	case 1:
+		timer.RecordFailure()
 		ee := &exec.ExitError{}
 		errors.As(err, &ee)
 		if h.EnableTerraformCLILogging {
 			h.Logger.Info(string(ee.Stderr), "operation", "plan")
 		}
 	case 2:
+		timer.RecordSuccess()
 		if h.EnableTerraformCLILogging {
 			h.Logger.Info(string(log), "operation", "plan")
 		}
 		return true, nil
+	default:
+		timer.RecordSuccess()
 	}
 	return false, Classify(err)
 }
 
 // Apply a Terraform configuration.
-func (h Harness) Apply(ctx context.Context, o ...Option) error {
+func (h Harness) Apply(ctx context.Context, ws string, o ...Option) error {
 	ao := &options{}
 	for _, fn := range o {
 		fn(ao)
@@ -614,14 +628,21 @@ func (h Harness) Apply(ctx context.Context, o ...Option) error {
 	// In case of terraform apply
 	// 0 - Succeeded
 	// Non Zero output - Errored
-
-	log, err := runCommand(ctx, cmd)
+	f, err := os.Create(filepath.Join("/logs", ws))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	timer := metrics.NewTerraformOperationTimer(filepath.Base(h.Dir), "apply")
+	log, err := runCommandv2(ctx, cmd, f)
 	switch cmd.ProcessState.ExitCode() {
 	case 0:
+		timer.RecordSuccess()
 		if h.EnableTerraformCLILogging {
 			h.Logger.Info(string(log), "operation", "apply")
 		}
 	default:
+		timer.RecordFailure()
 		ee := &exec.ExitError{}
 		errors.As(err, &ee)
 		if h.EnableTerraformCLILogging {
@@ -632,7 +653,7 @@ func (h Harness) Apply(ctx context.Context, o ...Option) error {
 }
 
 // Destroy a Terraform configuration.
-func (h Harness) Destroy(ctx context.Context, o ...Option) error {
+func (h Harness) Destroy(ctx context.Context, ws string, o ...Option) error {
 	do := &options{}
 	for _, fn := range o {
 		fn(do)
@@ -655,18 +676,25 @@ func (h Harness) Destroy(ctx context.Context, o ...Option) error {
 		rwmutex.RLock()
 		defer rwmutex.RUnlock()
 	}
-
-	log, err := runCommand(ctx, cmd)
+	f, err := os.Create(filepath.Join("/logs", ws))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	timer := metrics.NewTerraformOperationTimer(filepath.Base(h.Dir), "destroy")
+	log, err := runCommandv2(ctx, cmd, f)
 
 	// In case of terraform destroy
 	// 0 - Succeeded
 	// Non Zero output - Errored
 	switch cmd.ProcessState.ExitCode() {
 	case 0:
+		timer.RecordSuccess()
 		if h.EnableTerraformCLILogging {
 			h.Logger.Info(string(log), "operation", "destroy")
 		}
 	default:
+		timer.RecordFailure()
 		ee := &exec.ExitError{}
 		errors.As(err, &ee)
 		if h.EnableTerraformCLILogging {
@@ -689,6 +717,35 @@ func runCommand(ctx context.Context, c *exec.Cmd) ([]byte, error) {
 		defer close(ch)
 		r, e := c.Output()
 		ch <- cmdResult{out: r, err: e}
+	}()
+	select {
+	case <-ctx.Done():
+		err := ctx.Err()
+		// This could be container termination or the reconciliation deadline was exceeded.  Either way send a
+		// SIGTERM to the running process and wait for either the command to finish or the process to get killed.
+		e := c.Process.Signal(syscall.SIGTERM)
+		if e != nil {
+			return nil, errors.Wrap(errors.Wrap(err, errRunCommand), errors.Wrap(e, errSigTerm).Error())
+		}
+		e = c.Wait()
+		if e != nil {
+			return nil, errors.Wrap(errors.Wrap(err, errRunCommand), errors.Wrap(e, errWaitTerm).Error())
+		}
+		return nil, errors.Wrap(err, errRunCommand)
+	case res := <-ch:
+		return res.out, res.err
+	}
+}
+
+// runCommand executes the requested command and sends the process SIGTERM if the context finishes before the command
+func runCommandv2(ctx context.Context, c *exec.Cmd, f io.Writer) ([]byte, error) {
+	ch := make(chan cmdResult, 1)
+	go func() {
+		defer close(ch)
+		c.Stderr = f
+		c.Stdout = f
+		e := c.Run()
+		ch <- cmdResult{err: e}
 	}()
 	select {
 	case <-ctx.Done():

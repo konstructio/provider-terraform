@@ -106,11 +106,11 @@ func (tf *MockTf) Diff(ctx context.Context, o ...terraform.Option) (bool, error)
 	return tf.MockDiff(ctx, o...)
 }
 
-func (tf *MockTf) Apply(ctx context.Context, o ...terraform.Option) error {
+func (tf *MockTf) Apply(ctx context.Context, _ string, o ...terraform.Option) error {
 	return tf.MockApply(ctx, o...)
 }
 
-func (tf *MockTf) Destroy(ctx context.Context, o ...terraform.Option) error {
+func (tf *MockTf) Destroy(ctx context.Context, _ string, o ...terraform.Option) error {
 	return tf.MockDestroy(ctx, o...)
 }
 
@@ -957,6 +957,7 @@ func TestConnect(t *testing.T) {
 				fs:        tc.fields.fs,
 				terraform: tc.fields.terraform,
 				logger:    logging.NewNopLogger(),
+				gitCreds:  func(context.Context, client.Client) ([]byte, error) { return []byte("creds"), nil },
 			}
 			_, err := c.Connect(tc.args.ctx, tc.args.mg)
 			if diff := cmp.Diff(tc.want, err, test.EquateErrors()); diff != "" {
