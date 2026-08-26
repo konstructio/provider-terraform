@@ -1,33 +1,44 @@
 name: Build and Push (konstructio ghcr)
 
-# Builds the provider-terraform controller container and pushes it to
-# ghcr.io/konstructio/provider-terraform. This is the image referenced by the
-# control plane's crossplane DeploymentRuntimeConfig (the crossplane *package*
-# stays upstream; only the controller binary is overridden). The stock
-# "Publish Provider Package" workflow targets ghcr.io/crossplane-contrib and the
-# upbound mirror, so it cannot produce the konstructio image — hence this one.
+# Builds the provider-terraform controller container from the fork's root
+# Dockerfile and pushes it to ghcr.io/konstructio/provider-terraform. This is
+# the image referenced by the control plane's crossplane
+# DeploymentRuntimeConfig (the crossplane *package* stays upstream; only the
+# controller binary is overridden). The stock "Publish Provider Package"
+# workflow targets ghcr.io/crossplane-contrib and the upbound mirror, so it
+# cannot produce the konstructio image — hence this one.
+#
+# Tags produced:
+#   git tag  vX.Y.Z        -> :vX.Y.Z and :latest       (release)
+#   push to  main-civo     -> :main-civo and :sha-<8>   (rolling)
+#   push to  hotfix-*      -> :branch-<8>
+#   workflow_dispatch      -> the tag you type in
+#
+# One-time setup: the ghcr.io/konstructio/provider-terraform package must grant
+# this repository's Actions token write access (package Settings -> Manage
+# Actions access -> add konstructio/provider-terraform, role Write). Until then,
+# set a GHCR_TOKEN repo secret (PAT with write:packages) and the login step
+# below will prefer it.
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Image tag (e.g. v0.0.1-rc.initfix)'
+        description: 'Image tag (e.g. v0.0.1-rc.1)'
         required: true
-        default: 'v0.0.1-rc.initfix'
   push:
     branches:
       - 'main-civo'
       - 'hotfix-*'
+    tags:
+      - 'v*'
 
 permissions:
   contents: read
   packages: write
 
 env:
-  # Fresh package name so this repo's Actions token owns it (the pre-existing
-  # provider-terraform package doesn't grant this repo push access). New GHCR
-  # packages default to private; flip this one to public once created.
-  IMAGE: ghcr.io/konstructio/provider-terraform-initfix
+  IMAGE: ghcr.io/konstructio/provider-terraform
 
 jobs:
   build-push:
@@ -39,13 +50,22 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Resolve image tag
+      - name: Resolve image tags
         id: tag
         run: |
-          TAG="${{ github.event.inputs.tag }}"
-          if [ -z "$TAG" ]; then TAG="branch-${GITHUB_SHA::8}"; fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Building ${IMAGE}:${TAG}"
+          SHORT="${GITHUB_SHA::8}"
+          case "${GITHUB_EVENT_NAME}:${GITHUB_REF}" in
+            workflow_dispatch:*)
+              TAGS="${IMAGE}:${{ github.event.inputs.tag }}" ;;
+            push:refs/tags/*)
+              TAGS="${IMAGE}:${GITHUB_REF_NAME},${IMAGE}:latest" ;;
+            push:refs/heads/main-civo)
+              TAGS="${IMAGE}:main-civo,${IMAGE}:sha-${SHORT}" ;;
+            *)
+              TAGS="${IMAGE}:branch-${SHORT}" ;;
+          esac
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "Building: $TAGS"
 
       - name: Build controller binary (linux/amd64)
         run: |
@@ -57,7 +77,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
 
       - uses: docker/build-push-action@v6
         with:
@@ -67,4 +87,4 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
+          tags: ${{ steps.tag.outputs.tags }}
