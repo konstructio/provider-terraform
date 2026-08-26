@@ -20,6 +20,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"testing"
 
@@ -117,6 +118,22 @@ func (tf *MockTf) Destroy(ctx context.Context, _ string, o ...terraform.Option) 
 
 func (tf *MockTf) DeleteCurrentWorkspace(ctx context.Context) error {
 	return tf.MockDeleteCurrentWorkspace(ctx)
+}
+
+// fsWithProviders returns a filesystem in which the workspace directory for uid
+// has a dependency lock file and the matching provider plugin present on disk,
+// i.e. the state in which Connect may safely skip terraform init.
+func fsWithProviders(uid types.UID) afero.Afero {
+	fs := afero.Afero{Fs: afero.NewMemMapFs()}
+	dir := filepath.Join(tfDir, string(uid))
+	lock := `provider "registry.terraform.io/hashicorp/null" {
+  version = "3.2.1"
+}
+`
+	_ = fs.WriteFile(filepath.Join(dir, ".terraform.lock.hcl"), []byte(lock), 0o644)
+	plugin := filepath.Join(dir, ".terraform", "providers", "registry.terraform.io", "hashicorp", "null", "3.2.1", goruntime.GOOS+"_"+goruntime.GOARCH)
+	_ = fs.WriteFile(filepath.Join(plugin, "terraform-provider-null"), []byte("bin"), 0o755)
+	return fs
 }
 
 func TestConnect(t *testing.T) {
@@ -678,7 +695,42 @@ func TestConnect(t *testing.T) {
 			want: errors.Wrap(errBoom, errChecksum),
 		},
 		"ChecksumMatches": {
-			reason: "We should return any error when generating the workspace checksum",
+			reason: "We should skip terraform init when the checksum matches and the provider plugins are present on disk",
+			fields: fields{kube: &test.MockClient{
+				MockGet: test.NewMockGetFn(nil),
+			},
+				usage: tfClient.LegacyTrackerFn(func(_ context.Context, _ resource.LegacyManaged) error { return nil }),
+				fs:    fsWithProviders(uid),
+				terraform: func(_ string, _ bool, _ bool, _ logging.Logger, _ ...string) tfclient {
+					return &MockTf{
+						MockGenerateChecksum: func(ctx context.Context) (string, error) { return tfChecksum, nil },
+						MockWorkspace:        func(_ context.Context, _ string) error { return nil },
+					}
+				},
+			},
+			args: args{
+				mg: &v1beta1.Workspace{
+					ObjectMeta: metav1.ObjectMeta{UID: uid},
+					Spec: v1beta1.WorkspaceSpec{
+						ClusterManagedResourceSpec: xpv2.ClusterManagedResourceSpec{
+							ProviderConfigReference: &xpv2.Reference{},
+						},
+						ForProvider: v1beta1.WorkspaceParameters{
+							Module: "I'm HCL!",
+							Source: v1beta1.ModuleSourceInline,
+						},
+					},
+					Status: v1beta1.WorkspaceStatus{
+						AtProvider: v1beta1.WorkspaceObservation{
+							Checksum: tfChecksum,
+						},
+					},
+				},
+			},
+			want: nil,
+		},
+		"ChecksumMatchesButPluginsMissing": {
+			reason: "We should still run terraform init when the checksum matches but the provider plugins are missing from disk",
 			fields: fields{kube: &test.MockClient{
 				MockGet: test.NewMockGetFn(nil),
 			},
@@ -687,6 +739,7 @@ func TestConnect(t *testing.T) {
 				terraform: func(_ string, _ bool, _ bool, _ logging.Logger, _ ...string) tfclient {
 					return &MockTf{
 						MockGenerateChecksum: func(ctx context.Context) (string, error) { return tfChecksum, nil },
+						MockInit:             func(_ context.Context, _ ...terraform.InitOption) error { return nil },
 						MockWorkspace:        func(_ context.Context, _ string) error { return nil },
 					}
 				},
