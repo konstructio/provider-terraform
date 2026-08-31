@@ -6,14 +6,15 @@
 // same App installed in several orgs is several Secrets sharing app_id and
 // private key but with distinct installation_ids). For every discovered Secret
 // the manager mints an installation token, resolves which org the installation
-// belongs to, and writes one path-scoped line per org into a single shared git
-// credentials file:
+// belongs to, and renders one path-scoped git credentials line per org:
 //
 //	https://x-access-token:<token>@github.com/<org>
 //
-// Together with `useHttpPath = true` in the container's gitconfig, git picks
-// the right token by repository path, so concurrent reconciles across orgs
-// share one file and cannot race each other's credentials.
+// The caller writes those lines into the workspace's own .git-credentials file
+// (the pre-existing $GIT_CRED_DIR flow). Because every workspace receives the
+// same content, concurrent reconciles across orgs stay consistent, and
+// `useHttpPath = true` in the container's gitconfig makes git pick the right
+// token by repository path.
 //
 // When the Workspace's module URL points at github.com, the manager also
 // probes the repository with the org's token (GET /repos/{org}/{repo}) so a
@@ -24,11 +25,11 @@ package githubapp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -44,6 +45,13 @@ import (
 	"github.com/upbound/provider-terraform/pkg/metrics"
 )
 
+// ErrNoSecrets reports that no GitHub App secrets exist at all. It is the
+// only manager error on which callers should fall back to the ProviderConfig
+// credential source: when App secrets exist they are authoritative, and any
+// other failure must surface instead of being papered over by fallback
+// credentials for the wrong org.
+var ErrNoSecrets = errors.New("no github app secrets found")
+
 const (
 	// DefaultSecretNamespace is where GitHub App secrets are discovered.
 	DefaultSecretNamespace = "crossplane-system"
@@ -52,12 +60,6 @@ const (
 	// legacySecretName is the pre-label secret honored for backward
 	// compatibility even when it carries no label.
 	legacySecretName = "github-app-credentials"
-
-	// CredentialsDir holds the shared git credentials file. It must NOT live
-	// under /tmp/tf, which the workdir garbage collector prunes.
-	CredentialsDir = "/tmp/tf-github-app"
-	// CredentialsFile is referenced by the container's gitconfig.
-	CredentialsFile = ".git-credentials"
 
 	tokenRefreshMargin = 5 * time.Minute
 	probeTimeout       = 5 * time.Second
@@ -97,7 +99,6 @@ type Manager struct {
 	// overridable for tests
 	apiBase    string
 	httpClient *http.Client
-	credFile   string
 	now        func() time.Time
 }
 
@@ -119,7 +120,6 @@ func NewManager() *Manager {
 		tokens:     map[string]*tokenEntry{},
 		apiBase:    "https://api.github.com",
 		httpClient: &http.Client{Timeout: 30 * time.Second},
-		credFile:   filepath.Join(CredentialsDir, CredentialsFile),
 		now:        time.Now,
 	}
 }
@@ -135,19 +135,19 @@ func Shared() *Manager {
 	return shared
 }
 
-// EnsureCredentials makes sure every discoverable GitHub App installation has
-// a live token in the shared credentials file, and, when module points at a
-// github.com repository, verifies that one of those tokens can access it. It
-// returns an error when no GitHub App credentials are usable for module; the
-// caller is expected to fall back to the ProviderConfig's own credential
-// source.
-func (m *Manager) EnsureCredentials(ctx context.Context, kube client.Client, module string) error {
+// GitCredentials returns the content of a git credentials file covering every
+// discoverable GitHub App installation (one path-scoped line per org), and,
+// when module points at a github.com repository, verifies that one of those
+// tokens can access it. It returns ErrNoSecrets when no GitHub App secrets
+// exist; every other error means App secrets are present but unusable for
+// module and must not be silently replaced by fallback credentials.
+func (m *Manager) GitCredentials(ctx context.Context, kube client.Client, module string) ([]byte, error) {
 	secrets, err := m.discoverSecrets(ctx, kube)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(secrets) == 0 {
-		return fmt.Errorf("no github app secrets found in namespace %q (label %q or legacy %q)", m.namespace, m.label, legacySecretName)
+		return nil, fmt.Errorf("%w in namespace %q (label %q or legacy %q)", ErrNoSecrets, m.namespace, m.label, legacySecretName)
 	}
 
 	m.mu.Lock()
@@ -177,21 +177,19 @@ func (m *Manager) EnsureCredentials(ctx context.Context, kube client.Client, mod
 		}
 	}
 	if live == 0 {
-		return fmt.Errorf("no usable github app token: %s", strings.Join(failures, "; "))
-	}
-
-	if err := m.writeCredentialsFile(); err != nil {
-		return fmt.Errorf("cannot write git credentials file: %w", err)
+		return nil, fmt.Errorf("no usable github app token: %s", strings.Join(failures, "; "))
 	}
 
 	// When we can tell which repository the module needs, verify access so a
 	// scope problem surfaces here with a clear message instead of failing the
 	// clone. Modules that don't point at github.com (or inline HCL whose
-	// nested module sources we cannot see) are served by the file as a whole.
+	// nested module sources we cannot see) are served by the lines as a whole.
 	if org, repo := ParseGitHubRepo(module); org != "" {
-		return m.verifyRepoAccess(ctx, org, repo, failures)
+		if err := m.verifyRepoAccess(ctx, org, repo, failures); err != nil {
+			return nil, err
+		}
 	}
-	return nil
+	return m.credentialLines(), nil
 }
 
 func (m *Manager) discoverSecrets(ctx context.Context, kube client.Client) ([]v1.Secret, error) {
@@ -323,9 +321,9 @@ func suffix(failures []string) string {
 	return " (" + strings.Join(failures, "; ") + ")"
 }
 
-// writeCredentialsFile atomically rewrites the shared credentials file with
-// one path-scoped line per live token. Callers must hold m.mu.
-func (m *Manager) writeCredentialsFile() error {
+// credentialLines renders one path-scoped credentials line per live token, in
+// stable order. Callers must hold m.mu.
+func (m *Manager) credentialLines() []byte {
 	var b strings.Builder
 	for _, name := range m.sortedTokenNames() {
 		t := m.tokens[name]
@@ -334,24 +332,7 @@ func (m *Manager) writeCredentialsFile() error {
 		}
 		fmt.Fprintf(&b, "https://x-access-token:%s@github.com/%s\n", t.token, t.org)
 	}
-	dir := filepath.Dir(m.credFile)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, CredentialsFile+".*")
-	if err != nil {
-		return err
-	}
-	if _, err := tmp.WriteString(b.String()); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmp.Name())
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmp.Name())
-		return err
-	}
-	return os.Rename(tmp.Name(), m.credFile)
+	return []byte(b.String())
 }
 
 func (m *Manager) sortedTokenNames() []string {

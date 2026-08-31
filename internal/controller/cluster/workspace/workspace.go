@@ -19,6 +19,7 @@ package workspace
 import (
 	"context"
 	"encoding/json"
+	goerrors "errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -136,7 +137,7 @@ func Setup(mgr ctrl.Manager, o controller.Options, timeout, pollJitter time.Dura
 		terraform: func(dir string, usePluginCache bool, enableTerraformCLILogging bool, logger logging.Logger, envs ...string) tfclient {
 			return terraform.Harness{Path: tfPath, Dir: dir, UsePluginCache: usePluginCache, EnableTerraformCLILogging: enableTerraformCLILogging, Logger: logger, Envs: envs}
 		},
-		gitCreds: githubapp.Shared().EnsureCredentials,
+		gitCreds: githubapp.Shared().GitCredentials,
 	}
 
 	opts := []managed.ReconcilerOption{
@@ -187,9 +188,9 @@ type connector struct {
 	logger    logging.Logger
 	fs        afero.Afero
 	terraform func(dir string, usePluginCache bool, enableTerraformCLILogging bool, logger logging.Logger, envs ...string) tfclient
-	// gitCreds ensures GitHub App git credentials are available for module. It
+	// gitCreds returns the content of the .git-credentials file for module. It
 	// defaults to the shared githubapp.Manager; tests may override it.
-	gitCreds func(ctx context.Context, kube client.Client, module string) error
+	gitCreds func(ctx context.Context, kube client.Client, module string) ([]byte, error)
 }
 
 func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.ExternalClient, error) { //nolint:gocyclo
@@ -223,24 +224,29 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 			continue
 		}
 		// Prefer GitHub App tokens minted from the labeled secrets in
-		// crossplane-system (SaaS installs). The manager maintains a shared,
-		// path-scoped credentials file covering every installed org, so this
+		// crossplane-system (SaaS installs). The manager returns one
+		// path-scoped credentials line per installed org, so the same content
 		// also serves inline modules whose HCL references private github.com
-		// module sources. When no GitHub App credentials are usable, fall back
-		// to the credential source configured on the ProviderConfig (GitLab
-		// installs, or orgs where the App cannot be installed).
-		ensure := c.gitCreds
-		if ensure == nil {
-			ensure = githubapp.Shared().EnsureCredentials
+		// module sources. When App secrets exist they are authoritative: any
+		// failure surfaces here rather than being papered over by fallback
+		// credentials for the wrong org. Only when no App secrets exist at
+		// all do we fall back to the credential source configured on the
+		// ProviderConfig (GitLab installs).
+		gitCreds := c.gitCreds
+		if gitCreds == nil {
+			gitCreds = githubapp.Shared().GitCredentials
 		}
-		ghErr := ensure(ctx, c.kube, cr.Spec.ForProvider.Module)
-		if ghErr == nil {
-			continue
-		}
-		l.Debug("GitHub App credentials unavailable, falling back to ProviderConfig credentials", "error", ghErr.Error())
-		data, fallbackErr := resource.CommonCredentialExtractor(ctx, cd.Source, c.kube, cd.CommonCredentialSelectors)
-		if fallbackErr != nil {
-			return nil, errors.Wrap(fallbackErr, errGetCreds+" (github app: "+ghErr.Error()+")")
+		data, ghErr := gitCreds(ctx, c.kube, cr.Spec.ForProvider.Module)
+		if ghErr != nil {
+			if !goerrors.Is(ghErr, githubapp.ErrNoSecrets) {
+				return nil, errors.Wrap(ghErr, errGetCreds)
+			}
+			l.Debug("No GitHub App secrets, falling back to ProviderConfig credentials", "error", ghErr.Error())
+			var fallbackErr error
+			data, fallbackErr = resource.CommonCredentialExtractor(ctx, cd.Source, c.kube, cd.CommonCredentialSelectors)
+			if fallbackErr != nil {
+				return nil, errors.Wrap(fallbackErr, errGetCreds+" (github app: "+ghErr.Error()+")")
+			}
 		}
 		// NOTE(bobh66): Put the git credentials file in /tmp/tf/<UUID> so it doesn't get removed or overwritten
 		// by the remote module source case

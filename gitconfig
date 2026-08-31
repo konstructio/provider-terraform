@@ -1,4 +1,3 @@
 [credential]
 	helper = store --file=$GIT_CRED_DIR/.git-credentials
-	helper = store --file=/tmp/tf-github-app/.git-credentials
 	useHttpPath = true

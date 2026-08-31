@@ -22,11 +22,10 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -107,7 +106,6 @@ func newTestManager(t *testing.T, gh *fakeGitHub) *Manager {
 	m := NewManager()
 	m.apiBase = srv.URL
 	m.httpClient = srv.Client()
-	m.credFile = filepath.Join(t.TempDir(), CredentialsFile)
 	return m
 }
 
@@ -116,7 +114,7 @@ func fakeKube(t *testing.T, objs ...client.Object) client.Client {
 	return fake.NewClientBuilder().WithObjects(objs...).Build()
 }
 
-func TestEnsureCredentials(t *testing.T) {
+func TestGitCredentials(t *testing.T) {
 	key := testPrivateKeyPEM(t)
 	ctx := context.Background()
 
@@ -132,13 +130,9 @@ func TestEnsureCredentials(t *testing.T) {
 		)
 
 		module := "git::https://github.com/konstructio/konstruct-templates.git//terraform/aws?ref=main"
-		if err := m.EnsureCredentials(ctx, kube, module); err != nil {
-			t.Fatalf("EnsureCredentials(...): %v", err)
-		}
-
-		b, err := os.ReadFile(m.credFile)
+		b, err := m.GitCredentials(ctx, kube, module)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("GitCredentials(...): %v", err)
 		}
 		got := string(b)
 		for _, want := range []string{
@@ -161,7 +155,7 @@ func TestEnsureCredentials(t *testing.T) {
 
 		module := "git::https://github.com/konstructio/infra.git?ref=v1"
 		for i := 0; i < 3; i++ {
-			if err := m.EnsureCredentials(ctx, kube, module); err != nil {
+			if _, err := m.GitCredentials(ctx, kube, module); err != nil {
 				t.Fatalf("call %d: %v", i, err)
 			}
 		}
@@ -174,10 +168,10 @@ func TestEnsureCredentials(t *testing.T) {
 		gh := &fakeGitHub{installations: map[string]string{"111": "konstructio"}}
 		m := newTestManager(t, gh)
 
-		if err := m.EnsureCredentials(ctx, fakeKube(t, appSecret("gh", "1", "42", "111", key)), "inline"); err != nil {
+		if _, err := m.GitCredentials(ctx, fakeKube(t, appSecret("gh", "1", "42", "111", key)), "inline"); err != nil {
 			t.Fatal(err)
 		}
-		if err := m.EnsureCredentials(ctx, fakeKube(t, appSecret("gh", "2", "42", "111", key)), "inline"); err != nil {
+		if _, err := m.GitCredentials(ctx, fakeKube(t, appSecret("gh", "2", "42", "111", key)), "inline"); err != nil {
 			t.Fatal(err)
 		}
 		if gh.mints != 2 {
@@ -190,7 +184,7 @@ func TestEnsureCredentials(t *testing.T) {
 		m := newTestManager(t, gh)
 		kube := fakeKube(t, appSecret("gh", "1", "42", "111", key))
 
-		err := m.EnsureCredentials(ctx, kube, "git::https://github.com/konstructio/hidden.git")
+		_, err := m.GitCredentials(ctx, kube, "git::https://github.com/konstructio/hidden.git")
 		if err == nil || !strings.Contains(err.Error(), "cannot access repository") {
 			t.Errorf("want repository access error, got: %v", err)
 		}
@@ -201,17 +195,17 @@ func TestEnsureCredentials(t *testing.T) {
 		m := newTestManager(t, gh)
 		kube := fakeKube(t, appSecret("gh", "1", "42", "111", key))
 
-		err := m.EnsureCredentials(ctx, kube, "git::https://github.com/other-org/repo.git")
+		_, err := m.GitCredentials(ctx, kube, "git::https://github.com/other-org/repo.git")
 		if err == nil || !strings.Contains(err.Error(), `no github app installation covers org "other-org"`) {
 			t.Errorf("want no-installation error, got: %v", err)
 		}
 	})
 
-	t.Run("NoSecretsFails", func(t *testing.T) {
+	t.Run("NoSecretsIsSentinel", func(t *testing.T) {
 		m := newTestManager(t, &fakeGitHub{})
-		err := m.EnsureCredentials(ctx, fakeKube(t), "git::https://github.com/o/r.git")
-		if err == nil || !strings.Contains(err.Error(), "no github app secrets found") {
-			t.Errorf("want no-secrets error, got: %v", err)
+		_, err := m.GitCredentials(ctx, fakeKube(t), "git::https://github.com/o/r.git")
+		if !errors.Is(err, ErrNoSecrets) {
+			t.Errorf("want ErrNoSecrets, got: %v", err)
 		}
 	})
 
@@ -224,7 +218,7 @@ func TestEnsureCredentials(t *testing.T) {
 		bad := appSecret("aaa-bad", "1", "not-a-number", "111", key)
 		kube := fakeKube(t, bad, appSecret("gh", "1", "42", "111", key))
 
-		if err := m.EnsureCredentials(ctx, kube, "git::https://github.com/konstructio/infra.git"); err != nil {
+		if _, err := m.GitCredentials(ctx, kube, "git::https://github.com/konstructio/infra.git"); err != nil {
 			t.Fatalf("good secret should win despite bad sibling: %v", err)
 		}
 	})
@@ -236,8 +230,12 @@ func TestEnsureCredentials(t *testing.T) {
 		legacy.Labels = nil
 		kube := fakeKube(t, legacy)
 
-		if err := m.EnsureCredentials(ctx, kube, "inline module, no github url"); err != nil {
+		b, err := m.GitCredentials(ctx, kube, "inline module, no github url")
+		if err != nil {
 			t.Fatalf("legacy secret should be discovered: %v", err)
+		}
+		if !strings.Contains(string(b), "github.com/konstructio") {
+			t.Errorf("want konstructio line, got: %s", b)
 		}
 	})
 }
