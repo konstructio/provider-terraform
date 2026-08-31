@@ -45,13 +45,12 @@ func testPrivateKeyPEM(t *testing.T) string {
 	return string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}))
 }
 
-func appSecret(name, rv, appID, installationID, key string) *v1.Secret {
+func appSecret(name, appID, installationID, key string) *v1.Secret {
 	return &v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:            name,
-			Namespace:       DefaultSecretNamespace,
-			ResourceVersion: rv,
-			Labels:          map[string]string{DefaultSecretLabel: "true"},
+			Name:      name,
+			Namespace: secretNamespace,
+			Labels:    map[string]string{secretLabel: "true"},
 		},
 		Data: map[string][]byte{
 			"app_id":                 []byte(appID),
@@ -61,36 +60,28 @@ func appSecret(name, rv, appID, installationID, key string) *v1.Secret {
 	}
 }
 
-// fakeGitHub serves the three endpoints the manager uses. Installations map
-// installation id -> org; repos holds "org/repo" keys the tokens may access.
+// fakeGitHub serves the two endpoints used: token minting per installation id,
+// and the repo access check. repos maps "org/repo" to the installation id
+// whose token may access it.
 type fakeGitHub struct {
-	installations map[string]string
-	repos         map[string]bool
-	mints         int
+	installations map[string]bool
+	repos         map[string]string
 }
 
 func (g *fakeGitHub) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /app/installations/{id}/access_tokens", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
-		if _, ok := g.installations[id]; !ok {
+		if !g.installations[id] {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		g.mints++
 		w.WriteHeader(http.StatusCreated)
 		fmt.Fprintf(w, `{"token":"ghs_%s","expires_at":%q}`, id, time.Now().Add(time.Hour).Format(time.RFC3339))
 	})
-	mux.HandleFunc("GET /app/installations/{id}", func(w http.ResponseWriter, r *http.Request) {
-		org, ok := g.installations[r.PathValue("id")]
-		if !ok {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		fmt.Fprintf(w, `{"account":{"login":%q}}`, org)
-	})
 	mux.HandleFunc("GET /repos/{org}/{repo}", func(w http.ResponseWriter, r *http.Request) {
-		if g.repos[r.PathValue("org")+"/"+r.PathValue("repo")] {
+		id := g.repos[r.PathValue("org")+"/"+r.PathValue("repo")]
+		if id != "" && r.Header.Get("Authorization") == "Bearer ghs_"+id {
 			fmt.Fprint(w, `{}`)
 			return
 		}
@@ -99,14 +90,12 @@ func (g *fakeGitHub) handler() http.Handler {
 	return mux
 }
 
-func newTestManager(t *testing.T, gh *fakeGitHub) *Manager {
+func stubGitHub(t *testing.T, gh *fakeGitHub) {
 	t.Helper()
 	srv := httptest.NewServer(gh.handler())
-	t.Cleanup(srv.Close)
-	m := NewManager()
-	m.apiBase = srv.URL
-	m.httpClient = srv.Client()
-	return m
+	prev := apiBaseURL
+	apiBaseURL = srv.URL
+	t.Cleanup(func() { apiBaseURL = prev; srv.Close() })
 }
 
 func fakeKube(t *testing.T, objs ...client.Object) client.Client {
@@ -114,128 +103,86 @@ func fakeKube(t *testing.T, objs ...client.Object) client.Client {
 	return fake.NewClientBuilder().WithObjects(objs...).Build()
 }
 
-func TestGitCredentials(t *testing.T) {
+func TestGetGitCredsFromGithubAppSecrets(t *testing.T) {
 	key := testPrivateKeyPEM(t)
 	ctx := context.Background()
 
-	t.Run("MultiOrgWritesPathScopedLines", func(t *testing.T) {
-		gh := &fakeGitHub{
-			installations: map[string]string{"111": "konstructio", "222": "gitops-ing"},
-			repos:         map[string]bool{"konstructio/konstruct-templates": true},
-		}
-		m := newTestManager(t, gh)
+	t.Run("FirstSecretWithRepoAccessWins", func(t *testing.T) {
+		stubGitHub(t, &fakeGitHub{
+			installations: map[string]bool{"111": true, "222": true},
+			repos:         map[string]string{"gitops-ing/gitops": "222"},
+		})
 		kube := fakeKube(t,
-			appSecret("gh-konstructio", "1", "42", "111", key),
-			appSecret("gh-gitops-ing", "1", "42", "222", key),
+			appSecret("gh-konstructio", "42", "111", key),
+			appSecret("gh-gitops-ing", "42", "222", key),
 		)
 
-		module := "git::https://github.com/konstructio/konstruct-templates.git//terraform/aws?ref=main"
-		b, err := m.GitCredentials(ctx, kube, module)
+		data, err := GetGitCredsFromGithubAppSecrets(ctx, kube, "git::https://github.com/gitops-ing/gitops.git//terraform/aws?ref=main")
 		if err != nil {
-			t.Fatalf("GitCredentials(...): %v", err)
+			t.Fatalf("GetGitCredsFromGithubAppSecrets(...): %v", err)
 		}
-		got := string(b)
-		for _, want := range []string{
-			"https://x-access-token:ghs_222@github.com/gitops-ing\n",
-			"https://x-access-token:ghs_111@github.com/konstructio\n",
-		} {
-			if !strings.Contains(got, want) {
-				t.Errorf("credentials file missing %q, got:\n%s", want, got)
-			}
+		if want := "https://x-access-token:ghs_222@github.com"; string(data) != want {
+			t.Errorf("got %q, want %q", data, want)
 		}
 	})
 
-	t.Run("TokenAndProbeAreCached", func(t *testing.T) {
-		gh := &fakeGitHub{
-			installations: map[string]string{"111": "konstructio"},
-			repos:         map[string]bool{"konstructio/infra": true},
-		}
-		m := newTestManager(t, gh)
-		kube := fakeKube(t, appSecret("gh", "1", "42", "111", key))
+	t.Run("NoGitHubModuleReturnsFirstMintedToken", func(t *testing.T) {
+		stubGitHub(t, &fakeGitHub{installations: map[string]bool{"111": true}})
+		kube := fakeKube(t, appSecret("gh", "42", "111", key))
 
-		module := "git::https://github.com/konstructio/infra.git?ref=v1"
-		for i := 0; i < 3; i++ {
-			if _, err := m.GitCredentials(ctx, kube, module); err != nil {
-				t.Fatalf("call %d: %v", i, err)
-			}
-		}
-		if gh.mints != 1 {
-			t.Errorf("want 1 token mint across repeat calls, got %d", gh.mints)
-		}
-	})
-
-	t.Run("RotatedSecretRemints", func(t *testing.T) {
-		gh := &fakeGitHub{installations: map[string]string{"111": "konstructio"}}
-		m := newTestManager(t, gh)
-
-		if _, err := m.GitCredentials(ctx, fakeKube(t, appSecret("gh", "1", "42", "111", key)), "inline"); err != nil {
+		data, err := GetGitCredsFromGithubAppSecrets(ctx, kube, "inline HCL, no github url")
+		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := m.GitCredentials(ctx, fakeKube(t, appSecret("gh", "2", "42", "111", key)), "inline"); err != nil {
-			t.Fatal(err)
-		}
-		if gh.mints != 2 {
-			t.Errorf("want re-mint after secret rotation, got %d mints", gh.mints)
+		if !strings.Contains(string(data), "ghs_111") {
+			t.Errorf("want first minted token, got %q", data)
 		}
 	})
 
-	t.Run("RepoNotGrantedFails", func(t *testing.T) {
-		gh := &fakeGitHub{installations: map[string]string{"111": "konstructio"}}
-		m := newTestManager(t, gh)
-		kube := fakeKube(t, appSecret("gh", "1", "42", "111", key))
+	t.Run("NoSecretWithAccessFails", func(t *testing.T) {
+		stubGitHub(t, &fakeGitHub{installations: map[string]bool{"111": true}})
+		kube := fakeKube(t, appSecret("gh", "42", "111", key))
 
-		_, err := m.GitCredentials(ctx, kube, "git::https://github.com/konstructio/hidden.git")
-		if err == nil || !strings.Contains(err.Error(), "cannot access repository") {
-			t.Errorf("want repository access error, got: %v", err)
+		_, err := GetGitCredsFromGithubAppSecrets(ctx, kube, "git::https://github.com/other-org/hidden.git")
+		if err == nil || !strings.Contains(err.Error(), "cannot access repository other-org/hidden") {
+			t.Errorf("want repo access error, got: %v", err)
 		}
 	})
 
-	t.Run("OrgWithoutInstallationFails", func(t *testing.T) {
-		gh := &fakeGitHub{installations: map[string]string{"111": "konstructio"}}
-		m := newTestManager(t, gh)
-		kube := fakeKube(t, appSecret("gh", "1", "42", "111", key))
+	t.Run("BadSecretSkippedGoodSecretWins", func(t *testing.T) {
+		stubGitHub(t, &fakeGitHub{
+			installations: map[string]bool{"111": true},
+			repos:         map[string]string{"konstructio/infra": "111"},
+		})
+		kube := fakeKube(t,
+			appSecret("aaa-bad", "not-a-number", "111", key),
+			appSecret("gh", "42", "111", key),
+		)
 
-		_, err := m.GitCredentials(ctx, kube, "git::https://github.com/other-org/repo.git")
-		if err == nil || !strings.Contains(err.Error(), `no github app installation covers org "other-org"`) {
-			t.Errorf("want no-installation error, got: %v", err)
+		if _, err := GetGitCredsFromGithubAppSecrets(ctx, kube, "git::https://github.com/konstructio/infra.git"); err != nil {
+			t.Fatalf("good secret should win despite bad sibling: %v", err)
 		}
 	})
 
 	t.Run("NoSecretsIsSentinel", func(t *testing.T) {
-		m := newTestManager(t, &fakeGitHub{})
-		_, err := m.GitCredentials(ctx, fakeKube(t), "git::https://github.com/o/r.git")
+		stubGitHub(t, &fakeGitHub{})
+		_, err := GetGitCredsFromGithubAppSecrets(ctx, fakeKube(t), "git::https://github.com/o/r.git")
 		if !errors.Is(err, ErrNoSecrets) {
 			t.Errorf("want ErrNoSecrets, got: %v", err)
 		}
 	})
 
-	t.Run("BadSecretSkippedGoodSecretWins", func(t *testing.T) {
-		gh := &fakeGitHub{
-			installations: map[string]string{"111": "konstructio"},
-			repos:         map[string]bool{"konstructio/infra": true},
-		}
-		m := newTestManager(t, gh)
-		bad := appSecret("aaa-bad", "1", "not-a-number", "111", key)
-		kube := fakeKube(t, bad, appSecret("gh", "1", "42", "111", key))
-
-		if _, err := m.GitCredentials(ctx, kube, "git::https://github.com/konstructio/infra.git"); err != nil {
-			t.Fatalf("good secret should win despite bad sibling: %v", err)
-		}
-	})
-
 	t.Run("LegacyUnlabeledSecretHonored", func(t *testing.T) {
-		gh := &fakeGitHub{installations: map[string]string{"111": "konstructio"}}
-		m := newTestManager(t, gh)
-		legacy := appSecret(legacySecretName, "1", "42", "111", key)
+		stubGitHub(t, &fakeGitHub{installations: map[string]bool{"111": true}})
+		legacy := appSecret(legacySecretName, "42", "111", key)
 		legacy.Labels = nil
-		kube := fakeKube(t, legacy)
 
-		b, err := m.GitCredentials(ctx, kube, "inline module, no github url")
+		data, err := GetGitCredsFromGithubAppSecrets(ctx, fakeKube(t, legacy), "inline module")
 		if err != nil {
 			t.Fatalf("legacy secret should be discovered: %v", err)
 		}
-		if !strings.Contains(string(b), "github.com/konstructio") {
-			t.Errorf("want konstructio line, got: %s", b)
+		if !strings.Contains(string(data), "ghs_111") {
+			t.Errorf("want legacy secret token, got %q", data)
 		}
 	})
 }

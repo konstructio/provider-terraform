@@ -137,7 +137,7 @@ func Setup(mgr ctrl.Manager, o controller.Options, timeout, pollJitter time.Dura
 		terraform: func(dir string, usePluginCache bool, enableTerraformCLILogging bool, logger logging.Logger, envs ...string) tfclient {
 			return terraform.Harness{Path: tfPath, Dir: dir, UsePluginCache: usePluginCache, EnableTerraformCLILogging: enableTerraformCLILogging, Logger: logger, Envs: envs}
 		},
-		gitCreds: githubapp.Shared().GitCredentials,
+		gitCreds: githubapp.GetGitCredsFromGithubAppSecrets,
 	}
 
 	opts := []managed.ReconcilerOption{
@@ -223,18 +223,15 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		if cd.Filename != gitCredentialsFilename {
 			continue
 		}
-		// Prefer GitHub App tokens minted from the labeled secrets in
-		// crossplane-system (SaaS installs). The manager returns one
-		// path-scoped credentials line per installed org, so the same content
-		// also serves inline modules whose HCL references private github.com
-		// module sources. When App secrets exist they are authoritative: any
-		// failure surfaces here rather than being papered over by fallback
-		// credentials for the wrong org. Only when no App secrets exist at
-		// all do we fall back to the credential source configured on the
-		// ProviderConfig (GitLab installs).
+		// Prefer GitHub App credentials: try each labeled secret in
+		// crossplane-system, return the first minted token that can access
+		// the module's repository. When App secrets exist they are
+		// authoritative; only when none exist at all do we fall back to the
+		// credential source configured on the ProviderConfig (GitLab
+		// installs).
 		gitCreds := c.gitCreds
 		if gitCreds == nil {
-			gitCreds = githubapp.Shared().GitCredentials
+			gitCreds = githubapp.GetGitCredsFromGithubAppSecrets
 		}
 		data, ghErr := gitCreds(ctx, c.kube, cr.Spec.ForProvider.Module)
 		if ghErr != nil {
