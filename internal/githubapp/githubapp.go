@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -44,6 +45,21 @@ var ErrNoSecrets = errors.New("no github app secrets found")
 
 // apiBaseURL is a variable so tests can point it at a stub server.
 var apiBaseURL = "https://api.github.com"
+
+// Installation tokens are valid for 1 hour; reuse a minted token for 45
+// minutes so a token near expiry is never handed to a clone.
+const tokenMaxAge = 45 * time.Minute
+
+type cachedToken struct {
+	token    string
+	issuedAt time.Time
+	secretRV string
+}
+
+var (
+	tokenCacheMu sync.Mutex
+	tokenCache   = map[string]cachedToken{}
+)
 
 // installationTokenResponse represents the GitHub API response for installation token creation.
 type installationTokenResponse struct {
@@ -107,6 +123,13 @@ func discoverSecrets(ctx context.Context, kube client.Client) ([]v1.Secret, erro
 }
 
 func mintFromSecret(ctx context.Context, secret v1.Secret) (string, error) {
+	tokenCacheMu.Lock()
+	if c, ok := tokenCache[secret.Name]; ok && time.Since(c.issuedAt) < tokenMaxAge && c.secretRV == secret.ResourceVersion {
+		tokenCacheMu.Unlock()
+		return c.token, nil
+	}
+	tokenCacheMu.Unlock()
+
 	privateKeyPEM := string(secret.Data["github_app_private_key"])
 
 	appID, err := strconv.ParseInt(string(secret.Data["app_id"]), 10, 64)
@@ -123,6 +146,10 @@ func mintFromSecret(ctx context.Context, secret v1.Secret) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to get installation token: %w", err)
 	}
+
+	tokenCacheMu.Lock()
+	tokenCache[secret.Name] = cachedToken{token: token, issuedAt: time.Now(), secretRV: secret.ResourceVersion}
+	tokenCacheMu.Unlock()
 	return token, nil
 }
 

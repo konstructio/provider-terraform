@@ -66,6 +66,7 @@ func appSecret(name, appID, installationID, key string) *v1.Secret {
 type fakeGitHub struct {
 	installations map[string]bool
 	repos         map[string]string
+	mints         int
 }
 
 func (g *fakeGitHub) handler() http.Handler {
@@ -76,6 +77,7 @@ func (g *fakeGitHub) handler() http.Handler {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
+		g.mints++
 		w.WriteHeader(http.StatusCreated)
 		fmt.Fprintf(w, `{"token":"ghs_%s","expires_at":%q}`, id, time.Now().Add(time.Hour).Format(time.RFC3339))
 	})
@@ -95,7 +97,8 @@ func stubGitHub(t *testing.T, gh *fakeGitHub) {
 	srv := httptest.NewServer(gh.handler())
 	prev := apiBaseURL
 	apiBaseURL = srv.URL
-	t.Cleanup(func() { apiBaseURL = prev; srv.Close() })
+	tokenCache = map[string]cachedToken{}
+	t.Cleanup(func() { apiBaseURL = prev; srv.Close(); tokenCache = map[string]cachedToken{} })
 }
 
 func fakeKube(t *testing.T, objs ...client.Object) client.Client {
@@ -161,6 +164,54 @@ func TestGetGitCredsFromGithubAppSecrets(t *testing.T) {
 
 		if _, err := GetGitCredsFromGithubAppSecrets(ctx, kube, "git::https://github.com/konstructio/infra.git"); err != nil {
 			t.Fatalf("good secret should win despite bad sibling: %v", err)
+		}
+	})
+
+	t.Run("TokenIsCachedFor45Minutes", func(t *testing.T) {
+		gh := &fakeGitHub{
+			installations: map[string]bool{"111": true},
+			repos:         map[string]string{"konstructio/infra": "111"},
+		}
+		stubGitHub(t, gh)
+		kube := fakeKube(t, appSecret("gh", "42", "111", key))
+
+		for i := 0; i < 3; i++ {
+			if _, err := GetGitCredsFromGithubAppSecrets(ctx, kube, "git::https://github.com/konstructio/infra.git"); err != nil {
+				t.Fatalf("call %d: %v", i, err)
+			}
+		}
+		if gh.mints != 1 {
+			t.Errorf("want 1 mint across repeat calls, got %d", gh.mints)
+		}
+
+		// An expired cache entry is re-minted.
+		tokenCacheMu.Lock()
+		tokenCache["gh"] = cachedToken{token: tokenCache["gh"].token, issuedAt: time.Now().Add(-46 * time.Minute), secretRV: tokenCache["gh"].secretRV}
+		tokenCacheMu.Unlock()
+		if _, err := GetGitCredsFromGithubAppSecrets(ctx, kube, "git::https://github.com/konstructio/infra.git"); err != nil {
+			t.Fatal(err)
+		}
+		if gh.mints != 2 {
+			t.Errorf("want re-mint after 45m, got %d mints", gh.mints)
+		}
+	})
+
+	t.Run("RotatedSecretRemints", func(t *testing.T) {
+		gh := &fakeGitHub{installations: map[string]bool{"111": true}}
+		stubGitHub(t, gh)
+
+		sec := appSecret("gh", "42", "111", key)
+		sec.ResourceVersion = "1"
+		if _, err := GetGitCredsFromGithubAppSecrets(ctx, fakeKube(t, sec), "inline"); err != nil {
+			t.Fatal(err)
+		}
+		sec2 := appSecret("gh", "42", "111", key)
+		sec2.ResourceVersion = "2"
+		if _, err := GetGitCredsFromGithubAppSecrets(ctx, fakeKube(t, sec2), "inline"); err != nil {
+			t.Fatal(err)
+		}
+		if gh.mints != 2 {
+			t.Errorf("want re-mint after secret rotation, got %d mints", gh.mints)
 		}
 	})
 
