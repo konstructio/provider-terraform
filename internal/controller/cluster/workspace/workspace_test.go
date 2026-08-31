@@ -1088,7 +1088,7 @@ provider "registry.terraform.io/hashicorp/aws" {
 				fs:        tc.fields.fs,
 				terraform: tc.fields.terraform,
 				logger:    logging.NewNopLogger(),
-				gitCreds:  func(context.Context, client.Client) ([]byte, error) { return []byte("creds"), nil },
+				gitCreds:  func(context.Context, client.Client, string) error { return errors.New("no github app") },
 			}
 			_, err := c.Connect(tc.args.ctx, tc.args.mg)
 
