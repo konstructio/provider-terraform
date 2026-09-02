@@ -42,6 +42,7 @@ import (
 	"github.com/upbound/provider-terraform/apis/namespaced"
 	"github.com/upbound/provider-terraform/apis/namespaced/v1beta1"
 	tfClient "github.com/upbound/provider-terraform/internal/clients"
+	"github.com/upbound/provider-terraform/internal/githubapp"
 	"github.com/upbound/provider-terraform/internal/terraform"
 )
 
@@ -1019,7 +1020,7 @@ func TestConnect(t *testing.T) {
 				fs:        tc.fields.fs,
 				terraform: tc.fields.terraform,
 				logger:    logging.NewNopLogger(),
-				gitCreds:  func(context.Context, client.Client) ([]byte, error) { return []byte("creds"), nil },
+				gitCreds:  func(context.Context, client.Client, string) ([]byte, error) { return nil, githubapp.ErrNoSecrets },
 			}
 			_, err := c.Connect(tc.args.ctx, tc.args.mg)
 			if diff := cmp.Diff(tc.want, err, test.EquateErrors()); diff != "" {
