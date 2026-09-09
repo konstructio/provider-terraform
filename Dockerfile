@@ -1,6 +1,6 @@
 FROM alpine
 
-RUN apk add --no-cache curl unzip bash git
+RUN apk add --no-cache curl unzip bash git tini
 
 # Terraform version
 ARG TERRAFORM_VERSION=1.14.9
@@ -44,4 +44,4 @@ COPY gitconfig /.gitconfig
 # Create required writable directories
 RUN mkdir -p /tf /tmp /logs && chmod -R 777 /tf /logs /tmp
 
-ENTRYPOINT ["/manager"]
+ENTRYPOINT ["/sbin/tini", "--", "/manager"]
