@@ -26,13 +26,17 @@ import (
 	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
 	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/test"
@@ -44,6 +48,14 @@ import (
 const testNamespace = "crossplane-system"
 
 var testNow = time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+
+// scheme returns a scheme with both Workspace APIs registered.
+func scheme() *runtime.Scheme {
+	s := runtime.NewScheme()
+	_ = clusterv1beta1.SchemeBuilder.AddToScheme(s)
+	_ = namespacedv1beta1.SchemeBuilder.AddToScheme(s)
+	return s
+}
 
 // shardDeploy builds a shard Deployment. replicas is what makes it active:
 // 0 means draining, and no Deployment at all means removed.
@@ -600,5 +612,75 @@ func TestCensus(t *testing.T) {
 	}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("Census(...): -want, +got:\n%s", diff)
+	}
+}
+
+// TestInstalledKinds covers the case that took down a real cluster: a package
+// that predates the namespaced Workspace API. Naming a kind whose CRD is
+// absent makes every list fail, so LeastLoaded, the migration gate and the
+// census all error and the controller for it never starts.
+func TestInstalledKinds(t *testing.T) {
+	gv := func(k Kind) schema.GroupVersionKind {
+		gvk, err := apiutil.GVKForObject(k.New(), scheme())
+		if err != nil {
+			t.Fatalf("cannot resolve GVK: %v", err)
+		}
+		return gvk
+	}
+	clusterGVK, namespacedGVK := gv(ClusterKind()), gv(NamespacedKind())
+
+	mapperFor := func(gvks ...schema.GroupVersionKind) meta.RESTMapper {
+		groups := make([]schema.GroupVersion, 0, len(gvks))
+		for _, g := range gvks {
+			groups = append(groups, g.GroupVersion())
+		}
+		m := meta.NewDefaultRESTMapper(groups)
+		for _, g := range gvks {
+			m.Add(g, meta.RESTScopeRoot)
+		}
+		return m
+	}
+
+	cases := map[string]struct {
+		reason string
+		mapper meta.RESTMapper
+		want   []string
+	}{
+		"BothInstalled": {
+			reason: "A cluster serving both APIs places both.",
+			mapper: mapperFor(clusterGVK, namespacedGVK),
+			want:   []string{"cluster", "namespaced"},
+		},
+		"OnlyClusterScoped": {
+			reason: "A package predating the namespaced Workspace API must not stop the assigner placing the cluster-scoped one.",
+			mapper: mapperFor(clusterGVK),
+			want:   []string{"cluster"},
+		},
+		"OnlyNamespaced": {
+			reason: "The reverse must hold too.",
+			mapper: mapperFor(namespacedGVK),
+			want:   []string{"namespaced"},
+		},
+		"NeitherInstalled": {
+			reason: "No Workspace API leaves nothing to place; Setup turns this into an error.",
+			mapper: mapperFor(),
+			want:   []string{},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := installedKinds(tc.mapper, scheme(), logging.NewNopLogger())
+			if err != nil {
+				t.Fatalf("installedKinds(...): unexpected error: %v\n%s", err, tc.reason)
+			}
+			names := make([]string, 0, len(got))
+			for _, k := range got {
+				names = append(names, k.Name)
+			}
+			if diff := cmp.Diff(tc.want, names, cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("installedKinds(...): -want, +got:\n%s\n%s", diff, tc.reason)
+			}
+		})
 	}
 }

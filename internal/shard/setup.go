@@ -21,10 +21,14 @@ import (
 	"time"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
+	"github.com/pkg/errors"
 	appsv1 "k8s.io/api/apps/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -32,6 +36,34 @@ import (
 
 // DefaultCensusInterval is how often placement gauges are refreshed.
 const DefaultCensusInterval = 30 * time.Second
+
+// errNoWorkspaceAPI reports that the cluster serves no Workspace API at all,
+// which leaves the assigner nothing to place.
+const errNoWorkspaceAPI = "no Workspace API is installed; nothing to place"
+
+// installedKinds returns the Workspace kinds the cluster serves. A kind whose
+// CRD is absent is logged and dropped rather than treated as an error: a
+// cluster may legitimately serve only one of the two.
+func installedKinds(mapper meta.RESTMapper, s *runtime.Scheme, log logging.Logger) ([]Kind, error) {
+	all := Kinds()
+	out := make([]Kind, 0, len(all))
+	for _, k := range all {
+		gvk, err := apiutil.GVKForObject(k.New(), s)
+		if err != nil {
+			return nil, errors.Wrap(err, "cannot resolve Workspace GroupVersionKind")
+		}
+		switch _, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version); {
+		case err == nil:
+			out = append(out, k)
+		case meta.IsNoMatchError(err):
+			log.Info("Workspace API not installed; the assigner will not place it. Restart it if the CRD is installed later.",
+				"kind", k.Name, "gvk", gvk.String())
+		default:
+			return nil, errors.Wrapf(err, "cannot look up a REST mapping for %s", gvk)
+		}
+	}
+	return out, nil
+}
 
 // SetupOptions configures Setup.
 type SetupOptions struct {
@@ -72,7 +104,22 @@ func Setup(mgr ctrl.Manager, log logging.Logger, o SetupOptions) error {
 		o.MigrationBatch = DefaultMigrationBatch
 	}
 
+	// Only place the Workspace kinds the cluster actually serves. A cluster
+	// running a provider package that predates the namespaced Workspace API
+	// has only the cluster-scoped one, and naming the other would make every
+	// list fail - so LeastLoaded, the migration gate and the census would all
+	// error, and the controller for it would log "if kind is a CRD, it should
+	// be installed before calling Start" forever.
+	kinds, err := installedKinds(mgr.GetRESTMapper(), mgr.GetScheme(), log)
+	if err != nil {
+		return err
+	}
+	if len(kinds) == 0 {
+		return errors.New(errNoWorkspaceAPI)
+	}
+
 	placer := NewPlacer(mgr.GetClient(), log,
+		WithKinds(kinds),
 		WithNamespace(o.Namespace),
 		WithStaleMigration(o.StaleMigration),
 		WithMigrationBatch(o.MigrationBatch),
@@ -84,7 +131,7 @@ func Setup(mgr ctrl.Manager, log logging.Logger, o SetupOptions) error {
 		WithPodReader(mgr.GetAPIReader()),
 	)
 
-	for _, k := range Kinds() {
+	for _, k := range kinds {
 		a := NewAssigner(mgr.GetClient(), k, placer, log.WithValues("kind", k.Name))
 
 		if err := ctrl.NewControllerManagedBy(mgr).
