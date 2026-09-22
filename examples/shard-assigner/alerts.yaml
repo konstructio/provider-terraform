@@ -1,0 +1,61 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: provider-terraform-sharding
+  namespace: crossplane-system
+spec:
+  groups:
+    - name: provider-terraform-sharding
+      rules:
+        # The important one. An unlabelled Workspace is reconciled by no shard
+        # at all, and nothing else surfaces that - it just silently stops.
+        - alert: TerraformWorkspaceUnsharded
+          expr: terraform_shard_workspaces_unlabelled > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: Workspaces have no shard label and are not being reconciled
+            description: >-
+              {{ $value }} Workspace(s) carry no terraform.crossplane.io/shard
+              label. No controller instance watches them. The shard assigner is
+              probably wedged or not running.
+
+        - alert: TerraformWorkspaceOnInactiveShard
+          expr: terraform_shard_workspaces_inactive_shard > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Workspaces are labelled to a draining or out-of-range shard
+            description: >-
+              {{ $value }} Workspace(s) still point at a shard that is draining
+              or above shardCount. Migrations are serialised, so a slow drain is
+              expected; ten minutes without progress is not.
+
+        - alert: TerraformShardMigrationStalled
+          expr: terraform_shard_workspaces_migrating > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: A Workspace migration has not completed
+            description: >-
+              A Workspace has carried terraform.crossplane.io/migrating-at for
+              over 30 minutes without reaching Synced=True on its new shard.
+              Past this cutoff the assigner stops letting it block the drain and
+              moves on, so check why that Workspace is not syncing.
+
+        - alert: TerraformShardImbalance
+          expr: >-
+            (max(terraform_shard_workspaces) - min(terraform_shard_workspaces))
+              > (0.5 * avg(terraform_shard_workspaces))
+          for: 30m
+          labels:
+            severity: info
+          annotations:
+            summary: Workspaces are unevenly distributed across shards
+            description: >-
+              Placement is least-loaded at assignment time and never rebalances
+              on its own, so drift accumulates as Workspaces are deleted. This
+              is informational - rebalancing is a deliberate action.
