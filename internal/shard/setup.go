@@ -45,6 +45,14 @@ type SetupOptions struct {
 	// CensusInterval is how often the placement gauges are refreshed. Zero
 	// selects DefaultCensusInterval.
 	CensusInterval time.Duration
+
+	// PodNamespace is where the sharded provider Deployments run.
+	PodNamespace string
+
+	// RequireShardOffline refuses to migrate a Workspace while its current
+	// shard still has a running pod. Keep it on unless the Terraform backend
+	// is confirmed to lock state.
+	RequireShardOffline bool
 }
 
 // Setup registers an assigner for every Workspace kind, plus the periodic
@@ -60,7 +68,15 @@ func Setup(mgr ctrl.Manager, log logging.Logger, o SetupOptions) error {
 		o.CensusInterval = DefaultCensusInterval
 	}
 
-	placer := NewPlacer(mgr.GetClient(), o.ConfigRef, log, WithStaleMigration(o.StaleMigration))
+	placer := NewPlacer(mgr.GetClient(), o.ConfigRef, log,
+		WithStaleMigration(o.StaleMigration),
+		WithRequireShardOffline(o.RequireShardOffline),
+		// The API reader, not the cache: shard liveness decides whether two
+		// terraform processes may touch the same state, so it must not be
+		// answered from a possibly stale cache - and caching every Pod in the
+		// cluster would be a serious memory cost for one boolean.
+		WithPodReader(mgr.GetAPIReader(), o.PodNamespace),
+	)
 
 	for _, k := range Kinds() {
 		a := NewAssigner(mgr.GetClient(), k, placer, log.WithValues("kind", k.Name))
@@ -141,6 +157,25 @@ func (c *census) run(ctx context.Context) {
 		return
 	}
 	record(got)
+
+	// Refresh the drain-blocked gauge here too, not only from Reconcile: a
+	// drain that is blocked has few reconciles left to drive it, and this is
+	// the signal telling an operator to scale that Deployment to zero.
+	if !c.placer.requireOffline {
+		return
+	}
+	online, err := c.placer.OnlineShards(ctx)
+	if err != nil {
+		c.log.Info("Cannot determine which shards are running", "error", err)
+		return
+	}
+	for shard := range cfg.Draining {
+		blocked := 0.0
+		if online[shard] {
+			blocked = 1
+		}
+		ShardDrainBlocked.WithLabelValues(shard).Set(blocked)
+	}
 }
 
 // NeedLeaderElection keeps the census on the active replica only.

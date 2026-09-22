@@ -60,6 +60,17 @@ var (
 		},
 	)
 
+	// ShardDrainBlocked is 1 while a shard that should be drained still has a
+	// running pod, so its Workspaces cannot be migrated safely. It is the
+	// signal that an operator needs to scale that Deployment to zero.
+	ShardDrainBlocked = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "terraform_shard_drain_blocked",
+			Help: "1 while a draining shard still has a running pod, blocking migration of its Workspaces",
+		},
+		[]string{"shard"},
+	)
+
 	// MigrationsStarted counts relabels from one shard onto another.
 	MigrationsStarted = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -86,6 +97,7 @@ func init() {
 		WorkspacesUnlabelled,
 		WorkspacesInactiveShard,
 		WorkspacesMigrating,
+		ShardDrainBlocked,
 		MigrationsStarted,
 		MigrationsCompleted,
 	)

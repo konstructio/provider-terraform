@@ -18,6 +18,13 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list", "watch"]
+  # Shard liveness. Before moving a Workspace off a shard the assigner checks
+  # that shard has no running pod: shards are separate processes, and two of
+  # them applying the same Workspace means two terraform processes writing the
+  # same remote state.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

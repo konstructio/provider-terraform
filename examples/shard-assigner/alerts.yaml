@@ -33,6 +33,21 @@ spec:
               or above shardCount. Migrations are serialised, so a slow drain is
               expected; ten minutes without progress is not.
 
+        # The drain is waiting on you: scale the draining shard's Deployment
+        # to zero. Until its pod is gone the assigner will not move its
+        # Workspaces, because both processes would write the same state.
+        - alert: TerraformShardDrainBlocked
+          expr: terraform_shard_drain_blocked > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: A draining shard still has a running pod
+            description: >-
+              Shard {{ $labels.shard }} is listed in `draining` but still has a
+              running pod, so the assigner will not migrate its Workspaces.
+              Scale that shard's Deployment to zero to let the drain proceed.
+
         - alert: TerraformShardMigrationStalled
           expr: terraform_shard_workspaces_migrating > 0
           for: 30m

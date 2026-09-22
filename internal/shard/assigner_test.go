@@ -21,6 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"fmt"
+
 	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
 	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 	"github.com/google/go-cmp/cmp"
@@ -97,11 +99,33 @@ func deleting() func(client.Object) {
 	}
 }
 
+// shardPods returns one running pod per named shard, labelled the way the
+// shard Deployments' pod templates must be.
+func shardPods(shards ...string) []corev1.Pod {
+	out := make([]corev1.Pod, 0, len(shards))
+	for i, s := range shards {
+		out = append(out, corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "crossplane-system",
+				Name:      fmt.Sprintf("provider-terraform-%s-%d", s, i),
+				Labels:    map[string]string{ShardLabel: s},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		})
+	}
+	return out
+}
+
 // fixture is the simulated cluster the mock client serves.
 type fixture struct {
 	config     map[string]string
 	cluster    []clusterv1beta1.Workspace
 	namespaced []namespacedv1beta1.Workspace
+
+	// pods is the set of shard pods. Nil means "the default": a running pod
+	// for every active shard, so a draining or out-of-range shard reads as
+	// offline and its Workspaces may migrate.
+	pods []corev1.Pod
 }
 
 // kube returns a mock client over the fixture, recording patched objects.
@@ -138,6 +162,8 @@ func (f fixture) kube(patched *[]client.Object) *test.MockClient {
 				l.Items = append([]clusterv1beta1.Workspace(nil), f.cluster...)
 			case *namespacedv1beta1.WorkspaceList:
 				l.Items = append([]namespacedv1beta1.Workspace(nil), f.namespaced...)
+			case *corev1.PodList:
+				l.Items = append([]corev1.Pod(nil), f.pods...)
 			}
 			return nil
 		},
@@ -152,7 +178,10 @@ func (f fixture) kube(patched *[]client.Object) *test.MockClient {
 
 func testAssigner(f fixture, k Kind, patched *[]client.Object, o ...PlacerOption) *Assigner {
 	kube := f.kube(patched)
-	o = append([]PlacerOption{WithClock(func() time.Time { return testNow })}, o...)
+	o = append([]PlacerOption{
+		WithClock(func() time.Time { return testNow }),
+		WithPodReader(kube, "crossplane-system"),
+	}, o...)
 	p := NewPlacer(kube, testConfigRef, logging.NewNopLogger(), o...)
 	return NewAssigner(kube, k, p, logging.NewNopLogger())
 }
@@ -170,10 +199,11 @@ func TestReconcile(t *testing.T) {
 		wantErr bool
 	}
 	cases := map[string]struct {
-		reason string
-		fixture
-		req  reconcile.Request
-		want want
+		reason     string
+		fixture    fixture
+		placerOpts []PlacerOption
+		req        reconcile.Request
+		want       want
 	}{
 		"UnlabelledGetsLeastLoaded": {
 			reason: "An unplaced Workspace lands on the emptiest active shard.",
@@ -315,6 +345,73 @@ func TestReconcile(t *testing.T) {
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
 			want: want{wantErr: true},
 		},
+		"SourceShardStillRunningBlocksMigration": {
+			reason: "Shards are separate processes. Moving a Workspace off a shard whose pod is alive lets two terraform processes write the same remote state, which an unlocked backend will not stop.",
+			fixture: fixture{
+				config:  map[string]string{KeyShardCount: "2", KeyDraining: "shard-1"},
+				cluster: []clusterv1beta1.Workspace{cws("a", "shard-1")},
+				pods:    shardPods("shard-0", "shard-1"),
+			},
+			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
+			want: want{result: reconcile.Result{RequeueAfter: RequeueShardOnline}, patches: 0},
+		},
+		"SourceShardScaledToZeroMigrates": {
+			reason: "Once the draining shard's pod is gone there is no second writer, so the migration is safe to make.",
+			fixture: fixture{
+				config:  map[string]string{KeyShardCount: "2", KeyDraining: "shard-1"},
+				cluster: []clusterv1beta1.Workspace{cws("a", "shard-1")},
+				pods:    shardPods("shard-0"),
+			},
+			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
+			want: want{shard: "shard-0", migratingSet: true, patches: 1},
+		},
+		"TerminatedShardPodCountsAsOffline": {
+			reason: "A pod whose containers have all terminated is running no terraform, so it must not block the drain forever.",
+			fixture: fixture{
+				config:  map[string]string{KeyShardCount: "2", KeyDraining: "shard-1"},
+				cluster: []clusterv1beta1.Workspace{cws("a", "shard-1")},
+				pods: append(shardPods("shard-0"), corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "crossplane-system", Name: "old-shard-1",
+						Labels: map[string]string{ShardLabel: "shard-1"},
+					},
+					Status: corev1.PodStatus{Phase: corev1.PodSucceeded},
+				}),
+			},
+			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
+			want: want{shard: "shard-0", migratingSet: true, patches: 1},
+		},
+		"UnlabelledShardPodsFailClosed": {
+			reason: "No shard-labelled pods is what a missing pod-template label looks like; reading it as 'everything is offline' would defeat the check exactly when it matters.",
+			fixture: fixture{
+				config:  map[string]string{KeyShardCount: "2", KeyDraining: "shard-1"},
+				cluster: []clusterv1beta1.Workspace{cws("a", "shard-1")},
+				pods:    []corev1.Pod{},
+			},
+			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
+			want: want{wantErr: true},
+		},
+		"RequireOfflineDisabledMigratesWhileRunning": {
+			reason: "With backend locking confirmed, an operator may opt back into migrating off a live shard.",
+			fixture: fixture{
+				config:  map[string]string{KeyShardCount: "2", KeyDraining: "shard-1"},
+				cluster: []clusterv1beta1.Workspace{cws("a", "shard-1")},
+				pods:    shardPods("shard-0", "shard-1"),
+			},
+			placerOpts: []PlacerOption{WithRequireShardOffline(false)},
+			req:        reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
+			want:       want{shard: "shard-0", migratingSet: true, patches: 1},
+		},
+		"FirstPlacementIgnoresShardLiveness": {
+			reason: "An unplaced Workspace has no current shard, so there is no second writer to wait for.",
+			fixture: fixture{
+				config:  map[string]string{KeyShardCount: "2", KeyDraining: "shard-1"},
+				cluster: []clusterv1beta1.Workspace{cws("new", "")},
+				pods:    shardPods("shard-0", "shard-1"),
+			},
+			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "new"}},
+			want: want{shard: "shard-0", patches: 1},
+		},
 		"BalancesAcrossBothKinds": {
 			reason: "A shard reconciles both Workspace kinds, so load must be counted across both.",
 			fixture: fixture{
@@ -331,8 +428,19 @@ func TestReconcile(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
+			f := tc.fixture
+			if f.pods == nil {
+				// Default: a pod for every shard that is still active, so a
+				// draining or out-of-range shard reads as offline.
+				cfg, err := ParseConfig(f.config)
+				if err == nil {
+					f.pods = shardPods(cfg.ActiveShards()...)
+				} else {
+					f.pods = shardPods("shard-0")
+				}
+			}
 			var patched []client.Object
-			a := testAssigner(tc.fixture, ClusterKind(), &patched)
+			a := testAssigner(f, ClusterKind(), &patched, tc.placerOpts...)
 
 			got, err := a.Reconcile(context.Background(), tc.req)
 			if tc.want.wantErr {
@@ -372,6 +480,7 @@ func TestReconcileNamespacedKind(t *testing.T) {
 			nws("ns", "a", "shard-0"), nws("ns", "new", ""),
 		},
 	}
+	f.pods = shardPods("shard-0", "shard-1")
 	var patched []client.Object
 	a := testAssigner(f, NamespacedKind(), &patched)
 
@@ -390,7 +499,9 @@ func TestReconcileNamespacedKind(t *testing.T) {
 
 func TestLeastLoadedTieBreak(t *testing.T) {
 	f := fixture{config: map[string]string{KeyShardCount: "3"}}
-	p := NewPlacer(f.kube(nil), testConfigRef, logging.NewNopLogger(), WithClock(func() time.Time { return testNow }))
+	kube := f.kube(nil)
+	p := NewPlacer(kube, testConfigRef, logging.NewNopLogger(),
+		WithClock(func() time.Time { return testNow }), WithPodReader(kube, "crossplane-system"))
 
 	cfg, err := p.LoadConfig(context.Background())
 	if err != nil {
@@ -416,7 +527,9 @@ func TestCensus(t *testing.T) {
 			cws("e", "shard-0", migrating(testNow)),
 		},
 	}
-	p := NewPlacer(f.kube(nil), testConfigRef, logging.NewNopLogger(), WithClock(func() time.Time { return testNow }))
+	kube := f.kube(nil)
+	p := NewPlacer(kube, testConfigRef, logging.NewNopLogger(),
+		WithClock(func() time.Time { return testNow }), WithPodReader(kube, "crossplane-system"))
 
 	cfg, err := p.LoadConfig(context.Background())
 	if err != nil {
