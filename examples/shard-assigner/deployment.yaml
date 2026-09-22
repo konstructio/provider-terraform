@@ -27,8 +27,8 @@ spec:
         - name: shard-assigner
           image: ghcr.io/konstructio/provider-terraform-shard-assigner:latest
           args:
-            - --config-namespace=crossplane-system
-            - --config-name=provider-terraform-shards
+            - --namespace=crossplane-system
+            - --migration-batch=5
             - --stale-migration=30m
           ports:
             - name: metrics

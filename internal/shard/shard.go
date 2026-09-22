@@ -20,23 +20,26 @@ limitations under the License.
 // only the Workspaces carrying its own shard name in the ShardLabel. Nothing
 // in the provider writes that label; this package owns placement.
 //
-// Desired state lives in a ConfigMap:
+// Desired state is the shard Deployments themselves - there is no separate
+// ConfigMap to drift from them:
 //
-//	data:
-//	  shardCount: "4"
-//	  draining: "shard-3"
+//	Deployment exists, replicas > 0   -> active, placeable
+//	Deployment exists, replicas == 0  -> draining, migrate away
+//	Deployment absent                 -> removed, migrate away
 //
-// Active shards are shard-0 .. shard-{shardCount-1} minus anything draining.
-// A Workspace's label is sticky: it is rewritten only when its current shard
-// is draining or has fallen out of range.
+// Expressing "draining" as replicas: 0 means it works for any shard, not only
+// the highest-numbered one, and it is something a GitOps repo already knows
+// how to say.
+//
+// A Workspace's label is sticky: it is rewritten only when its shard stops
+// being active.
 package shard
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
-
-	"github.com/pkg/errors"
 
 	"github.com/upbound/provider-terraform/internal/workdir"
 )
@@ -46,27 +49,19 @@ const (
 	// alias rather than a copy: the provider reads the same constant to filter
 	// its informers, and a drift between writer and reader would silently
 	// leave every Workspace unreconciled.
+	//
+	// It appears in three places, doing three jobs:
+	//   - on a Workspace, it is the assignment
+	//   - on a shard Deployment's own labels, it declares the shard exists
+	//   - on that Deployment's pod template, it makes the shard's pods
+	//     findable, which is how a migration knows the old process is gone
 	ShardLabel = workdir.ShardLabel
 
 	// MigratingAtAnnotation records when a Workspace was relabelled onto a
 	// new shard, RFC3339. It is present only between the relabel and the
 	// Workspace reporting Synced=True on its new owner, which is what makes
-	// "one migration at a time" expressible level-triggered.
+	// the migration batch limit expressible level-triggered.
 	MigratingAtAnnotation = "terraform.crossplane.io/migrating-at"
-)
-
-// ConfigMap keys.
-const (
-	KeyShardCount = "shardCount"
-	KeyDraining   = "draining"
-)
-
-// Error strings.
-const (
-	errNoShardCount      = "config is missing the " + KeyShardCount + " key"
-	errFmtBadShardCount  = "cannot parse " + KeyShardCount + " %q"
-	errFmtNonPositive    = "shardCount must be at least 1, got %d"
-	errFmtUnknownDrainer = "draining lists %q, which is not a valid shard name"
 )
 
 // ShardName returns the canonical name of shard i.
@@ -87,64 +82,37 @@ func shardIndex(name string) (int, bool) {
 	return i, true
 }
 
-// A Config is the desired sharding state.
-type Config struct {
-	// Count is the number of shards that exist, shard-0 .. shard-{Count-1}.
-	Count int
-
-	// Draining holds shards that still own Workspaces but must not be given
-	// any more.
-	Draining map[string]bool
+// A Fleet is the set of shards that are currently placeable, as declared by
+// the shard Deployments.
+type Fleet struct {
+	active  map[string]bool
+	ordered []string
 }
 
-// ParseConfig reads a Config out of ConfigMap data.
-func ParseConfig(data map[string]string) (Config, error) {
-	raw, ok := data[KeyShardCount]
-	if !ok {
-		return Config{}, errors.New(errNoShardCount)
-	}
-
-	n, err := strconv.Atoi(strings.TrimSpace(raw))
-	if err != nil {
-		return Config{}, errors.Errorf(errFmtBadShardCount, raw)
-	}
-	if n < 1 {
-		return Config{}, errors.Errorf(errFmtNonPositive, n)
-	}
-
-	cfg := Config{Count: n, Draining: map[string]bool{}}
-	for _, d := range strings.Split(data[KeyDraining], ",") {
-		d = strings.TrimSpace(d)
-		if d == "" {
+// NewFleet returns a Fleet over the given active shard names. Names that are
+// not canonical are dropped. The result is ordered by shard index so that
+// placement ties break deterministically toward the lowest one.
+func NewFleet(active []string) Fleet {
+	f := Fleet{active: make(map[string]bool, len(active)), ordered: make([]string, 0, len(active))}
+	for _, s := range active {
+		if _, ok := shardIndex(s); !ok || f.active[s] {
 			continue
 		}
-		if _, ok := shardIndex(d); !ok {
-			return Config{}, errors.Errorf(errFmtUnknownDrainer, d)
-		}
-		cfg.Draining[d] = true
+		f.active[s] = true
+		f.ordered = append(f.ordered, s)
 	}
-	return cfg, nil
+	sort.Slice(f.ordered, func(i, j int) bool {
+		a, _ := shardIndex(f.ordered[i])
+		b, _ := shardIndex(f.ordered[j])
+		return a < b
+	})
+	return f
 }
 
-// Active reports whether shard is one this Config still places Workspaces on.
+// Active reports whether shard is one this Fleet still places Workspaces on.
 // The empty string is never active, so an unlabelled Workspace always needs
 // placement.
-func (c Config) Active(shard string) bool {
-	i, ok := shardIndex(shard)
-	if !ok || i >= c.Count {
-		return false
-	}
-	return !c.Draining[shard]
-}
+func (f Fleet) Active(shard string) bool { return f.active[shard] }
 
-// ActiveShards lists the placeable shards in index order. Callers rely on that
-// ordering to break ties deterministically.
-func (c Config) ActiveShards() []string {
-	out := make([]string, 0, c.Count)
-	for i := range c.Count {
-		if s := ShardName(i); !c.Draining[s] {
-			out = append(out, s)
-		}
-	}
-	return out
-}
+// ActiveShards lists the placeable shards in index order.
+func (f Fleet) ActiveShards() []string { return f.ordered }

@@ -23,18 +23,20 @@ import (
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
 	"github.com/pkg/errors"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // Error strings.
 const (
-	errGetConfig      = "cannot get shard config"
-	errParseConfig    = "cannot parse shard config"
-	errListWorkspaces = "cannot list workspaces"
-	errNoActiveShards = "no active shards: every shard is draining or shardCount is unset"
-	errListShardPods  = "cannot list shard pods"
+	errListWorkspaces  = "cannot list workspaces"
+	errListShardDeploy = "cannot list shard deployments"
+	errListShardPods   = "cannot list shard pods"
+	errNoActiveShards  = "no active shards: every shard deployment is scaled to zero or being deleted"
+
+	errFmtNoShardDeployments = "no deployment in namespace %q carries the %s label. Label every shard " +
+		"Deployment with it - that label is how the assigner learns which shards exist"
 
 	errFmtNoShardPods = "cannot verify which shards are running: no pod in namespace %q carries the %s label. " +
 		"Label every shard Deployment's pod template with it, or set --require-shard-offline=false if the " +
@@ -47,15 +49,22 @@ const (
 // drain forever.
 const DefaultStaleMigration = 30 * time.Minute
 
+// DefaultMigrationBatch is how many Workspaces may be migrating at once.
+//
+// Handover overlap is not why this is limited: a migration only happens once
+// the old shard's pod is gone, so there is no second writer. It is limited so
+// a drained shard's Workspaces do not arrive as one burst of terraform init on
+// the receiving shards, which serialise on the provider's plugin-cache lock.
+const DefaultMigrationBatch = 5
+
 // A Placer answers placement questions across every Workspace kind. One Placer
-// is shared by the per-kind reconcilers, so load balancing and the
-// one-at-a-time migration gate see all Workspaces rather than only those of
-// whichever kind happens to be reconciling.
+// is shared by the per-kind reconcilers, so load balancing and the migration
+// batch limit see all Workspaces rather than only those of whichever kind
+// happens to be reconciling.
 type Placer struct {
-	kube   client.Reader
-	kinds  []Kind
-	cfgRef types.NamespacedName
-	log    logging.Logger
+	kube  client.Reader
+	kinds []Kind
+	log   logging.Logger
 
 	// pods answers "is this shard's process still running". It must be a
 	// live, uncached reader: a stale cache here decides whether two terraform
@@ -63,15 +72,18 @@ type Placer struct {
 	// caching every Pod in the cluster.
 	pods client.Reader
 
-	// podNamespace is where the sharded provider Deployments run.
-	podNamespace string
+	// namespace is where the shard Deployments and their pods live.
+	namespace string
 
 	// requireOffline refuses to migrate a Workspace while its current shard
-	// still has a running pod. Shards are separate processes, so a shard being
-	// listed in draining says nothing about whether it is still mid-apply.
+	// still has a running pod. Shards are separate processes, so a Deployment
+	// scaled to zero says nothing about whether its pod is still mid-apply.
 	requireOffline bool
 
-	// staleAfter bounds how long a stalled migration blocks the drain.
+	// batch is the most Workspaces that may be migrating at once.
+	batch int
+
+	// staleAfter bounds how long a stalled migration occupies a batch slot.
 	staleAfter time.Duration
 
 	// cost weights a Workspace when choosing the least-loaded shard. It
@@ -84,25 +96,21 @@ type Placer struct {
 
 	// mu serialises the read-decide-write sequence in placement. Both kind
 	// controllers share one Placer and each runs its own worker, so without
-	// this two Workspaces can clear the one-at-a-time migration gate
-	// concurrently and migrate together.
+	// this the batch limit can be exceeded by concurrent decisions.
 	mu sync.Mutex
-}
-
-// Lock serialises a placement decision. The caller must call the returned
-// function once the decision has been written. The happy path - a Workspace
-// already on an active shard - does not take this lock.
-func (p *Placer) Lock() func() {
-	p.mu.Lock()
-	return p.mu.Unlock
 }
 
 // A PlacerOption configures a Placer.
 type PlacerOption func(*Placer)
 
-// WithStaleMigration sets how long a stalled migration blocks further ones.
+// WithStaleMigration sets how long a stalled migration occupies a batch slot.
 func WithStaleMigration(d time.Duration) PlacerOption {
 	return func(p *Placer) { p.staleAfter = d }
+}
+
+// WithMigrationBatch sets how many Workspaces may migrate at once.
+func WithMigrationBatch(n int) PlacerOption {
+	return func(p *Placer) { p.batch = n }
 }
 
 // WithCost sets the weighting function used to pick the least-loaded shard.
@@ -115,10 +123,15 @@ func WithClock(f func() time.Time) PlacerOption {
 	return func(p *Placer) { p.now = f }
 }
 
-// WithPodReader sets the live reader and namespace used to check whether a
-// shard still has a running pod.
-func WithPodReader(r client.Reader, namespace string) PlacerOption {
-	return func(p *Placer) { p.pods, p.podNamespace = r, namespace }
+// WithPodReader sets the live reader used to check whether a shard still has a
+// running pod.
+func WithPodReader(r client.Reader) PlacerOption {
+	return func(p *Placer) { p.pods = r }
+}
+
+// WithNamespace sets where the shard Deployments and their pods live.
+func WithNamespace(ns string) PlacerOption {
+	return func(p *Placer) { p.namespace = ns }
 }
 
 // WithRequireShardOffline sets whether a Workspace may be migrated while its
@@ -133,21 +146,27 @@ func WithRequireShardOffline(v bool) PlacerOption {
 	return func(p *Placer) { p.requireOffline = v }
 }
 
-// NewPlacer returns a Placer reading desired state from the named ConfigMap.
-// kube must be an uncached reader, or a reader whose cache is not shard
-// filtered: a Placer that cannot see other shards' Workspaces will pile every
-// new Workspace onto one shard.
-func NewPlacer(kube client.Reader, cfgRef types.NamespacedName, log logging.Logger, o ...PlacerOption) *Placer {
+// Lock serialises a placement decision. The caller must call the returned
+// function once the decision has been written. The happy path - a Workspace
+// already on an active shard - does not take this lock.
+func (p *Placer) Lock() func() {
+	p.mu.Lock()
+	return p.mu.Unlock
+}
+
+// NewPlacer returns a Placer. kube reads Workspaces and shard Deployments and
+// may be cached; the pod reader set by WithPodReader must not be.
+func NewPlacer(kube client.Reader, log logging.Logger, o ...PlacerOption) *Placer {
 	p := &Placer{
 		kube:           kube,
 		kinds:          Kinds(),
-		cfgRef:         cfgRef,
 		log:            log,
+		namespace:      "crossplane-system",
+		requireOffline: true,
+		batch:          DefaultMigrationBatch,
 		staleAfter:     DefaultStaleMigration,
 		cost:           func(Workspace) float64 { return 1 },
 		now:            time.Now,
-		requireOffline: true,
-		podNamespace:   "crossplane-system",
 	}
 	for _, fn := range o {
 		fn(p)
@@ -155,14 +174,91 @@ func NewPlacer(kube client.Reader, cfgRef types.NamespacedName, log logging.Logg
 	return p
 }
 
-// LoadConfig reads the desired sharding state.
-func (p *Placer) LoadConfig(ctx context.Context) (Config, error) {
-	cm := &corev1.ConfigMap{}
-	if err := p.kube.Get(ctx, p.cfgRef, cm); err != nil {
-		return Config{}, errors.Wrap(err, errGetConfig)
+// Batch returns the migration batch limit.
+func (p *Placer) Batch() int { return p.batch }
+
+// LoadFleet reads the declared shards straight off the shard Deployments.
+// There is no ConfigMap: spec.replicas is already the desired state, and
+// mirroring it into a second object would only create something to drift.
+//
+// A Deployment that is being deleted does not count - Argo's prune leaves it
+// around briefly while its pods drain, and it is not placeable in that window.
+func (p *Placer) LoadFleet(ctx context.Context) (Fleet, error) {
+	list := &appsv1.DeploymentList{}
+	if err := p.kube.List(ctx, list,
+		client.InNamespace(p.namespace),
+		client.HasLabels{ShardLabel},
+	); err != nil {
+		return Fleet{}, errors.Wrap(err, errListShardDeploy)
 	}
-	cfg, err := ParseConfig(cm.Data)
-	return cfg, errors.Wrap(err, errParseConfig)
+	if len(list.Items) == 0 {
+		return Fleet{}, errors.Errorf(errFmtNoShardDeployments, p.namespace, ShardLabel)
+	}
+
+	active := make([]string, 0, len(list.Items))
+	for _, d := range list.Items {
+		name := d.Labels[ShardLabel]
+		if _, ok := shardIndex(name); !ok {
+			p.log.Debug("Ignoring deployment with a non-canonical shard label",
+				"deployment", d.Name, ShardLabel, name)
+			continue
+		}
+		if d.DeletionTimestamp != nil {
+			continue
+		}
+		if d.Spec.Replicas == nil || *d.Spec.Replicas < 1 {
+			continue
+		}
+		active = append(active, name)
+	}
+	return NewFleet(active), nil
+}
+
+// OnlineShards returns the set of shards that still have a running pod.
+//
+// It fails closed: any error and the caller must not migrate anything.
+//
+// Finding no shard-labelled pods at all is treated as an error rather than as
+// "everything is offline". That is what a missing pod-template label looks
+// like, and silently reading it as "safe to migrate" would defeat the check
+// exactly when it matters.
+func (p *Placer) OnlineShards(ctx context.Context) (map[string]bool, error) {
+	pods := &corev1.PodList{}
+	if err := p.pods.List(ctx, pods,
+		client.InNamespace(p.namespace),
+		client.HasLabels{ShardLabel},
+	); err != nil {
+		return nil, errors.Wrap(err, errListShardPods)
+	}
+	if len(pods.Items) == 0 {
+		return nil, errors.Errorf(errFmtNoShardPods, p.namespace, ShardLabel)
+	}
+
+	online := map[string]bool{}
+	for _, pod := range pods.Items {
+		// Succeeded and Failed mean every container has terminated, so no
+		// terraform is running. Anything else - including a pod still
+		// terminating inside its grace period - counts as online, because
+		// that is exactly when an apply may still be in flight.
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		online[pod.Labels[ShardLabel]] = true
+	}
+	return online, nil
+}
+
+// ShardOnline reports whether shard still has a pod running. It is the gate on
+// every migration: shards are separate processes, and relabelling a Workspace
+// off a shard whose pod is alive lets two terraform processes write the same
+// remote state. With an unlocked backend that is silent corruption, not a lock
+// contention error.
+func (p *Placer) ShardOnline(ctx context.Context, shard string) (bool, error) {
+	online, err := p.OnlineShards(ctx)
+	if err != nil {
+		return false, err
+	}
+	return online[shard], nil
 }
 
 // forEach calls fn for every Workspace of every kind.
@@ -181,8 +277,8 @@ func (p *Placer) forEach(ctx context.Context, fn func(Workspace)) error {
 
 // LeastLoaded returns the active shard carrying the least load. Ties break
 // toward the lowest shard index, so the choice is deterministic.
-func (p *Placer) LeastLoaded(ctx context.Context, cfg Config) (string, error) {
-	active := cfg.ActiveShards()
+func (p *Placer) LeastLoaded(ctx context.Context, f Fleet) (string, error) {
+	active := f.ActiveShards()
 	if len(active) == 0 {
 		return "", errors.New(errNoActiveShards)
 	}
@@ -214,7 +310,7 @@ func (p *Placer) LeastLoaded(ctx context.Context, cfg Config) (string, error) {
 // MigrationsInFlight counts Workspaces that have been relabelled onto a new
 // shard but have not yet reported Synced=True there. A migration whose
 // annotation is older than staleAfter, or unparseable, is logged and not
-// counted, so it cannot wedge a drain.
+// counted, so it cannot hold a batch slot forever.
 func (p *Placer) MigrationsInFlight(ctx context.Context) (int, error) {
 	n := 0
 	err := p.forEach(ctx, func(ws Workspace) {
@@ -229,7 +325,7 @@ func (p *Placer) MigrationsInFlight(ctx context.Context) (int, error) {
 			return
 		}
 		if age := p.now().Sub(started); age > p.staleAfter {
-			p.log.Info("Migration is stale and no longer blocking the drain; the workspace has not synced on its new shard",
+			p.log.Info("Migration is stale and no longer holds a batch slot; the workspace has not synced on its new shard",
 				"workspace", ws.GetName(), "shard", ws.GetLabels()[ShardLabel],
 				"age", age.String(), "cutoff", p.staleAfter.String())
 			return
@@ -248,8 +344,8 @@ type Census struct {
 	// these, so any non-zero value is a wedged assigner.
 	Unlabelled int
 
-	// Inactive counts Workspaces labelled to a shard that is draining or out
-	// of range - a migration that has not happened yet.
+	// Inactive counts Workspaces labelled to a shard that is no longer
+	// active - a migration that has not happened yet.
 	Inactive int
 
 	// Migrating counts Workspaces carrying the migrating-at annotation.
@@ -257,9 +353,9 @@ type Census struct {
 }
 
 // Census counts Workspaces by placement state.
-func (p *Placer) Census(ctx context.Context, cfg Config) (Census, error) {
+func (p *Placer) Census(ctx context.Context, f Fleet) (Census, error) {
 	c := Census{PerShard: map[string]int{}}
-	for _, s := range cfg.ActiveShards() {
+	for _, s := range f.ActiveShards() {
 		c.PerShard[s] = 0
 	}
 	err := p.forEach(ctx, func(ws Workspace) {
@@ -270,58 +366,11 @@ func (p *Placer) Census(ctx context.Context, cfg Config) (Census, error) {
 		switch {
 		case s == "":
 			c.Unlabelled++
-		case cfg.Active(s):
+		case f.Active(s):
 			c.PerShard[s]++
 		default:
 			c.Inactive++
 		}
 	})
 	return c, err
-}
-
-// OnlineShards returns the set of shards that still have a running pod.
-//
-// It fails closed: any error and the caller must not migrate anything.
-//
-// Finding no shard-labelled pods at all is treated as an error rather than as
-// "everything is offline". That is what a missing pod-template label looks
-// like, and silently reading it as "safe to migrate" would defeat the check
-// exactly when it matters.
-func (p *Placer) OnlineShards(ctx context.Context) (map[string]bool, error) {
-	pods := &corev1.PodList{}
-	if err := p.pods.List(ctx, pods,
-		client.InNamespace(p.podNamespace),
-		client.HasLabels{ShardLabel},
-	); err != nil {
-		return nil, errors.Wrap(err, errListShardPods)
-	}
-	if len(pods.Items) == 0 {
-		return nil, errors.Errorf(errFmtNoShardPods, p.podNamespace, ShardLabel)
-	}
-
-	online := map[string]bool{}
-	for _, pod := range pods.Items {
-		// Succeeded and Failed mean every container has terminated, so no
-		// terraform is running. Anything else - including a pod still
-		// terminating inside its grace period - counts as online, because
-		// that is exactly when an apply may still be in flight.
-		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
-			continue
-		}
-		online[pod.Labels[ShardLabel]] = true
-	}
-	return online, nil
-}
-
-// ShardOnline reports whether shard still has a pod running. It is the gate on
-// every migration: shards are separate processes, and relabelling a Workspace
-// off a shard whose pod is alive lets two terraform processes write the same
-// remote state. With an unlocked backend that is silent corruption, not a lock
-// contention error.
-func (p *Placer) ShardOnline(ctx context.Context, shard string) (bool, error) {
-	online, err := p.OnlineShards(ctx)
-	if err != nil {
-		return false, err
-	}
-	return online[shard], nil
 }

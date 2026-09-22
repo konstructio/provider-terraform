@@ -15,9 +15,14 @@ rules:
   - apiGroups: ["tf.upbound.io", "tf.m.upbound.io"]
     resources: ["workspaces"]
     verbs: ["get", "list", "watch", "patch"]
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["get", "list", "watch"]
+  # The shard Deployments ARE the desired state - there is no ConfigMap. The
+  # assigner reads spec.replicas to learn which shards are placeable, and
+  # patches it only to drive a drain it started itself. It never creates or
+  # deletes them: those come from GitOps, so image upgrades and rollback keep
+  # working the way they already do.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "patch"]
   # Shard liveness. Before moving a Workspace off a shard the assigner checks
   # that shard has no running pod: shards are separate processes, and two of
   # them applying the same Workspace means two terraform processes writing the
