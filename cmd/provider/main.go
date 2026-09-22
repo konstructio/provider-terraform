@@ -40,13 +40,16 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -157,15 +160,46 @@ func main() {
 	}
 	leaderElectionID := "crossplane-leader-election-provider-terraform"
 
+	clusterWS := &clusterv1beta1.Workspace{}
+	namespacedWS := &namespacedv1beta1.Workspace{}
+
+	// Which Workspace APIs this shard will reconcile. Unsharded, both are
+	// attempted and the CRD gate copes with either being absent.
+	shardReconciles := map[client.Object]bool{clusterWS: true, namespacedWS: true}
+
 	if *shardName != "" {
+		// Only filter the informers of Workspace APIs the cluster actually
+		// serves. cache.ByObject makes controller-runtime resolve a REST
+		// mapping when the manager is built, which is fatal if the CRD is
+		// absent - and a cluster running an older provider package has only
+		// the cluster-scoped Workspace, not the namespaced one:
+		//
+		//   failed to determine if *v1beta1.Workspace is namespaced: no
+		//   matches for kind "Workspace" in version "tf.m.upbound.io/v1beta1"
+		installed, err := installedAPIs(cfg, scheme, clusterWS, namespacedWS)
+		kingpin.FatalIfError(err, "Cannot determine which Workspace APIs are installed")
+		shardReconciles = installed
+
 		// Filter this instance's Workspace informers to its own shard, so
 		// cache memory and watch traffic scale with this shard's share rather
 		// than with the whole fleet. The shard assigner writes the label; a
 		// Workspace that has none is reconciled by no instance at all, which
 		// is what the assigner's unlabelled-Workspace alert catches.
 		sel := labels.SelectorFromSet(labels.Set{workdir.ShardLabel: *shardName})
-		byObject[&clusterv1beta1.Workspace{}] = cache.ByObject{Label: sel}
-		byObject[&namespacedv1beta1.Workspace{}] = cache.ByObject{Label: sel}
+		for o, ok := range installed {
+			gvk, err := apiutil.GVKForObject(o, scheme)
+			kingpin.FatalIfError(err, "Cannot resolve Workspace GroupVersionKind")
+			if !ok {
+				// Deliberately skip the controller too. An unfiltered informer
+				// would make this shard reconcile every Workspace of that kind
+				// the moment its CRD appeared, which is the one thing sharding
+				// must not do.
+				log.Info("Workspace API not installed; this shard will not reconcile it. Restart the provider if its CRD is installed later.",
+					"gvk", gvk.String(), "shard", *shardName)
+				continue
+			}
+			byObject[o] = cache.ByObject{Label: sel}
+		}
 
 		// Per-shard leases. A single fleet-wide lease would elect one leader
 		// across every shard and defeat the point of running several.
@@ -276,12 +310,20 @@ func main() {
 		clusterOpts.Gate = crdGate
 		namespacedOpts.Gate = crdGate
 		kingpin.FatalIfError(customresourcesgate.Setup(mgr, namespacedOpts), "Cannot setup CRD gate")
-		kingpin.FatalIfError(clusterworkspace.SetupGated(mgr, clusterOpts, *timeout, *pollJitter), "Cannot setup cluster-scoped Workspace controllers")
-		kingpin.FatalIfError(namespacedworkspace.SetupGated(mgr, namespacedOpts, *timeout, *pollJitter), "Cannot setup namespaced Workspace controllers")
+		if shardReconciles[clusterWS] {
+			kingpin.FatalIfError(clusterworkspace.SetupGated(mgr, clusterOpts, *timeout, *pollJitter), "Cannot setup cluster-scoped Workspace controllers")
+		}
+		if shardReconciles[namespacedWS] {
+			kingpin.FatalIfError(namespacedworkspace.SetupGated(mgr, namespacedOpts, *timeout, *pollJitter), "Cannot setup namespaced Workspace controllers")
+		}
 	} else {
 		log.Info("Provider has missing RBAC permissions for watching CRDs, controller SafeStart capability will be disabled")
-		kingpin.FatalIfError(clusterworkspace.Setup(mgr, clusterOpts, *timeout, *pollJitter), "Cannot setup cluster-scoped Workspace controllers")
-		kingpin.FatalIfError(namespacedworkspace.Setup(mgr, namespacedOpts, *timeout, *pollJitter), "Cannot setup namespaced Workspace controllers")
+		if shardReconciles[clusterWS] {
+			kingpin.FatalIfError(clusterworkspace.Setup(mgr, clusterOpts, *timeout, *pollJitter), "Cannot setup cluster-scoped Workspace controllers")
+		}
+		if shardReconciles[namespacedWS] {
+			kingpin.FatalIfError(namespacedworkspace.Setup(mgr, namespacedOpts, *timeout, *pollJitter), "Cannot setup namespaced Workspace controllers")
+		}
 	}
 	kingpin.FatalIfError(mgr.Start(ctrl.SetupSignalHandler()), "Cannot start controller manager")
 }
@@ -300,6 +342,38 @@ func UseJSON() zap.Opts {
 		encoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
 		o.Encoder = zapcore.NewJSONEncoder(encoderConfig)
 	}
+}
+
+// installedAPIs reports, for each object, whether the cluster serves its kind.
+// A missing kind is reported as false rather than as an error; anything else
+// is an error, because guessing would either crash the manager or silently
+// leave a Workspace API unreconciled.
+func installedAPIs(cfg *rest.Config, s *runtime.Scheme, objs ...client.Object) (map[client.Object]bool, error) {
+	httpClient, err := rest.HTTPClientFor(cfg)
+	if err != nil {
+		return nil, errors.Wrap(err, "cannot build an HTTP client for API discovery")
+	}
+	mapper, err := apiutil.NewDynamicRESTMapper(cfg, httpClient)
+	if err != nil {
+		return nil, errors.Wrap(err, "cannot build a REST mapper for API discovery")
+	}
+
+	out := make(map[client.Object]bool, len(objs))
+	for _, o := range objs {
+		gvk, err := apiutil.GVKForObject(o, s)
+		if err != nil {
+			return nil, errors.Wrap(err, "cannot resolve GroupVersionKind")
+		}
+		switch _, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version); {
+		case err == nil:
+			out[o] = true
+		case meta.IsNoMatchError(err):
+			out[o] = false
+		default:
+			return nil, errors.Wrapf(err, "cannot look up a REST mapping for %s", gvk)
+		}
+	}
+	return out, nil
 }
 
 func canWatchCRD(ctx context.Context, mgr manager.Manager) (bool, error) {
