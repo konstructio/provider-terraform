@@ -22,141 +22,91 @@ import (
 	"github.com/google/go-cmp/cmp"
 )
 
-func TestParseConfig(t *testing.T) {
-	type args struct {
-		data map[string]string
-	}
-	type want struct {
-		cfg     Config
-		wantErr bool
-	}
+func TestNewFleet(t *testing.T) {
 	cases := map[string]struct {
 		reason string
-		args   args
-		want   want
-	}{
-		"CountOnly": {
-			reason: "A bare shardCount yields that many shards and nothing draining.",
-			args:   args{data: map[string]string{KeyShardCount: "4"}},
-			want:   want{cfg: Config{Count: 4, Draining: map[string]bool{}}},
-		},
-		"WithDraining": {
-			reason: "Draining shards are parsed out of the comma separated list.",
-			args:   args{data: map[string]string{KeyShardCount: "4", KeyDraining: "shard-3"}},
-			want:   want{cfg: Config{Count: 4, Draining: map[string]bool{"shard-3": true}}},
-		},
-		"DrainingWhitespaceAndEmpties": {
-			reason: "Whitespace and empty entries in draining are ignored rather than rejected.",
-			args:   args{data: map[string]string{KeyShardCount: "4", KeyDraining: " shard-2 , ,shard-3,"}},
-			want:   want{cfg: Config{Count: 4, Draining: map[string]bool{"shard-2": true, "shard-3": true}}},
-		},
-		"EmptyDrainingIsFine": {
-			reason: "An empty draining value is the normal steady state.",
-			args:   args{data: map[string]string{KeyShardCount: "2", KeyDraining: ""}},
-			want:   want{cfg: Config{Count: 2, Draining: map[string]bool{}}},
-		},
-		"MissingCount": {
-			reason: "shardCount is required; guessing a default would silently misplace everything.",
-			args:   args{data: map[string]string{KeyDraining: "shard-1"}},
-			want:   want{wantErr: true},
-		},
-		"UnparseableCount": {
-			reason: "A non-numeric shardCount is an operator error, not a reason to proceed.",
-			args:   args{data: map[string]string{KeyShardCount: "four"}},
-			want:   want{wantErr: true},
-		},
-		"ZeroCount": {
-			reason: "Zero shards would leave every Workspace unreconciled.",
-			args:   args{data: map[string]string{KeyShardCount: "0"}},
-			want:   want{wantErr: true},
-		},
-		"NegativeCount": {
-			reason: "A negative shardCount is nonsense.",
-			args:   args{data: map[string]string{KeyShardCount: "-1"}},
-			want:   want{wantErr: true},
-		},
-		"MalformedDrainingName": {
-			reason: "A typo in draining must fail loudly, or a drain silently never happens.",
-			args:   args{data: map[string]string{KeyShardCount: "4", KeyDraining: "shard3"}},
-			want:   want{wantErr: true},
-		},
-	}
-
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			got, err := ParseConfig(tc.args.data)
-			if tc.want.wantErr {
-				if err == nil {
-					t.Errorf("ParseConfig(...): want error, got none\n%s", tc.reason)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("ParseConfig(...): unexpected error: %v\n%s", err, tc.reason)
-			}
-			if diff := cmp.Diff(tc.want.cfg, got); diff != "" {
-				t.Errorf("ParseConfig(...): -want, +got:\n%s\n%s", diff, tc.reason)
-			}
-		})
-	}
-}
-
-func TestConfigActive(t *testing.T) {
-	cfg := Config{Count: 4, Draining: map[string]bool{"shard-3": true}}
-
-	cases := map[string]struct {
-		reason string
-		shard  string
-		want   bool
-	}{
-		"InRange":       {reason: "A shard inside the count and not draining is active.", shard: "shard-0", want: true},
-		"LastInRange":   {reason: "shard-{count-1} is the highest active index.", shard: "shard-2", want: true},
-		"Draining":      {reason: "A draining shard takes no new Workspaces.", shard: "shard-3", want: false},
-		"OutOfRange":    {reason: "A shard at or above the count no longer exists.", shard: "shard-4", want: false},
-		"Unlabelled":    {reason: "The empty label always needs placement.", shard: "", want: false},
-		"Malformed":     {reason: "A hand-written label is treated as unplaced rather than trusted.", shard: "shard-1-old", want: false},
-		"NoPrefix":      {reason: "A name without the shard- prefix is not a shard.", shard: "1", want: false},
-		"LeadingZero":   {reason: "shard-01 is not canonical and must not alias shard-1.", shard: "shard-01", want: false},
-		"NegativeIndex": {reason: "A negative index is not a shard.", shard: "shard--1", want: false},
-		"EmptyIndex":    {reason: "A bare prefix is not a shard.", shard: "shard-", want: false},
-	}
-
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			if got := cfg.Active(tc.shard); got != tc.want {
-				t.Errorf("Active(%q): want %v, got %v\n%s", tc.shard, tc.want, got, tc.reason)
-			}
-		})
-	}
-}
-
-func TestActiveShards(t *testing.T) {
-	cases := map[string]struct {
-		reason string
-		cfg    Config
+		active []string
 		want   []string
 	}{
-		"AllActive": {
-			reason: "With nothing draining every shard is placeable, in index order.",
-			cfg:    Config{Count: 3},
-			want:   []string{"shard-0", "shard-1", "shard-2"},
+		"SortsByIndexNotString": {
+			reason: "Ties break toward the lowest index, so ordering must be numeric - shard-10 sorts after shard-9, not before it.",
+			active: []string{"shard-10", "shard-2", "shard-9", "shard-0"},
+			want:   []string{"shard-0", "shard-2", "shard-9", "shard-10"},
 		},
-		"OneDraining": {
-			reason: "A draining shard drops out but the rest keep their order.",
-			cfg:    Config{Count: 4, Draining: map[string]bool{"shard-1": true}},
-			want:   []string{"shard-0", "shard-2", "shard-3"},
+		"DropsNonCanonicalNames": {
+			reason: "A hand-written label must not become a placement target.",
+			active: []string{"shard-0", "shard-1-old", "shard-", "worker-1", "shard-01"},
+			want:   []string{"shard-0"},
 		},
-		"AllDraining": {
-			reason: "Draining everything leaves nowhere to place, which callers must handle.",
-			cfg:    Config{Count: 2, Draining: map[string]bool{"shard-0": true, "shard-1": true}},
+		"Deduplicates": {
+			reason: "Two Deployments labelled for the same shard should count once.",
+			active: []string{"shard-0", "shard-0", "shard-1"},
+			want:   []string{"shard-0", "shard-1"},
+		},
+		"Empty": {
+			reason: "Every shard scaled to zero leaves nowhere to place, which callers must handle.",
+			active: []string{},
 			want:   []string{},
 		},
 	}
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			if diff := cmp.Diff(tc.want, tc.cfg.ActiveShards()); diff != "" {
-				t.Errorf("ActiveShards(): -want, +got:\n%s\n%s", diff, tc.reason)
+			if diff := cmp.Diff(tc.want, NewFleet(tc.active).ActiveShards()); diff != "" {
+				t.Errorf("NewFleet(...).ActiveShards(): -want, +got:\n%s\n%s", diff, tc.reason)
+			}
+		})
+	}
+}
+
+func TestFleetActive(t *testing.T) {
+	f := NewFleet([]string{"shard-0", "shard-1", "shard-2"})
+
+	cases := map[string]struct {
+		reason string
+		shard  string
+		want   bool
+	}{
+		"Active":      {reason: "A shard with a scaled-up Deployment is placeable.", shard: "shard-0", want: true},
+		"NotDeclared": {reason: "A shard with no Deployment - pruned, or scaled to zero - is not placeable.", shard: "shard-3", want: false},
+		"Unlabelled":  {reason: "The empty label always needs placement.", shard: "", want: false},
+		"Malformed":   {reason: "A hand-written label is treated as unplaced rather than trusted.", shard: "shard-1-old", want: false},
+		"LeadingZero": {reason: "shard-01 is not canonical and must not alias shard-1.", shard: "shard-01", want: false},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := f.Active(tc.shard); got != tc.want {
+				t.Errorf("Active(%q): want %v, got %v\n%s", tc.shard, tc.want, got, tc.reason)
+			}
+		})
+	}
+}
+
+func TestShardIndex(t *testing.T) {
+	cases := map[string]struct {
+		in     string
+		wantI  int
+		wantOK bool
+	}{
+		"Zero":        {in: "shard-0", wantI: 0, wantOK: true},
+		"TwoDigits":   {in: "shard-12", wantI: 12, wantOK: true},
+		"LeadingZero": {in: "shard-01", wantOK: false},
+		"NoIndex":     {in: "shard-", wantOK: false},
+		"NoPrefix":    {in: "0", wantOK: false},
+		"Negative":    {in: "shard--1", wantOK: false},
+		"Suffix":      {in: "shard-1-old", wantOK: false},
+		"Empty":       {in: "", wantOK: false},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			i, ok := shardIndex(tc.in)
+			if ok != tc.wantOK {
+				t.Fatalf("shardIndex(%q): want ok=%v, got %v", tc.in, tc.wantOK, ok)
+			}
+			if ok && i != tc.wantI {
+				t.Errorf("shardIndex(%q): want %d, got %d", tc.in, tc.wantI, i)
 			}
 		})
 	}

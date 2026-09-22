@@ -33,9 +33,8 @@ const (
 	errClear        = "cannot clear migration annotation"
 )
 
-// RequeueMigration is how long to wait before re-checking whether the
-// in-flight migration has landed. Migrations are serialised, so a Workspace
-// waiting its turn simply asks again.
+// RequeueMigration is how long to wait before re-checking whether a batch slot
+// has freed up. A Workspace waiting its turn simply asks again.
 const RequeueMigration = 15 * time.Second
 
 // RequeueShardOnline is how long to wait before re-checking whether a shard
@@ -67,7 +66,7 @@ func NewAssigner(kube client.Client, k Kind, p *Placer, log logging.Logger) *Ass
 
 // Reconcile places a single Workspace.
 func (a *Assigner) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
-	cfg, err := a.placer.LoadConfig(ctx)
+	fleet, err := a.placer.LoadFleet(ctx)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
@@ -84,7 +83,7 @@ func (a *Assigner) Reconcile(ctx context.Context, req reconcile.Request) (reconc
 	}
 
 	cur := ws.GetLabels()[ShardLabel]
-	if cfg.Active(cur) {
+	if fleet.Active(cur) {
 		// Happy path, and where the overwhelming majority of calls end.
 		return reconcile.Result{}, a.completeMigration(ctx, ws)
 	}
@@ -115,19 +114,20 @@ func (a *Assigner) Reconcile(ctx context.Context, req reconcile.Request) (reconc
 			ShardDrainBlocked.WithLabelValues(cur).Set(0)
 		}
 
-		// Serialising migrations keeps the handover one Workspace wide, so a
-		// receiving shard is not hit by a whole shard's worth of terraform
-		// init at once.
+		// Cap how many migrate at once. Overlap is not the concern here - the
+		// old shard's pod is already gone - but a whole shard's Workspaces
+		// arriving as one burst of terraform init would pile up on the
+		// receiving shards' plugin-cache lock.
 		n, err := a.placer.MigrationsInFlight(ctx)
 		if err != nil {
 			return reconcile.Result{}, err
 		}
-		if n > 0 {
+		if n >= a.placer.Batch() {
 			return reconcile.Result{RequeueAfter: RequeueMigration}, nil
 		}
 	}
 
-	target, err := a.placer.LeastLoaded(ctx, cfg)
+	target, err := a.placer.LeastLoaded(ctx, fleet)
 	if err != nil {
 		return reconcile.Result{}, err
 	}

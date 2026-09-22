@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
-	corev1 "k8s.io/api/core/v1"
+	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -35,19 +35,20 @@ const DefaultCensusInterval = 30 * time.Second
 
 // SetupOptions configures Setup.
 type SetupOptions struct {
-	// ConfigRef names the ConfigMap holding shardCount and draining.
-	ConfigRef types.NamespacedName
+	// Namespace is where the shard Deployments and their pods live.
+	Namespace string
 
-	// StaleMigration bounds how long a stalled migration blocks a drain.
+	// StaleMigration bounds how long a stalled migration holds a batch slot.
 	// Zero selects DefaultStaleMigration.
 	StaleMigration time.Duration
+
+	// MigrationBatch is how many Workspaces may migrate at once. Zero selects
+	// DefaultMigrationBatch.
+	MigrationBatch int
 
 	// CensusInterval is how often the placement gauges are refreshed. Zero
 	// selects DefaultCensusInterval.
 	CensusInterval time.Duration
-
-	// PodNamespace is where the sharded provider Deployments run.
-	PodNamespace string
 
 	// RequireShardOffline refuses to migrate a Workspace while its current
 	// shard still has a running pod. Keep it on unless the Terraform backend
@@ -58,8 +59,8 @@ type SetupOptions struct {
 // Setup registers an assigner for every Workspace kind, plus the periodic
 // census that drives the placement gauges.
 //
-// The manager's cache must NOT be shard filtered: the assigner needs to see
-// every Workspace to balance across shards.
+// The manager's cache must NOT be shard filtered: the assigner balances across
+// shards, so it must see every Workspace.
 func Setup(mgr ctrl.Manager, log logging.Logger, o SetupOptions) error {
 	if o.StaleMigration == 0 {
 		o.StaleMigration = DefaultStaleMigration
@@ -67,15 +68,20 @@ func Setup(mgr ctrl.Manager, log logging.Logger, o SetupOptions) error {
 	if o.CensusInterval == 0 {
 		o.CensusInterval = DefaultCensusInterval
 	}
+	if o.MigrationBatch == 0 {
+		o.MigrationBatch = DefaultMigrationBatch
+	}
 
-	placer := NewPlacer(mgr.GetClient(), o.ConfigRef, log,
+	placer := NewPlacer(mgr.GetClient(), log,
+		WithNamespace(o.Namespace),
 		WithStaleMigration(o.StaleMigration),
+		WithMigrationBatch(o.MigrationBatch),
 		WithRequireShardOffline(o.RequireShardOffline),
 		// The API reader, not the cache: shard liveness decides whether two
 		// terraform processes may touch the same state, so it must not be
 		// answered from a possibly stale cache - and caching every Pod in the
 		// cluster would be a serious memory cost for one boolean.
-		WithPodReader(mgr.GetAPIReader(), o.PodNamespace),
+		WithPodReader(mgr.GetAPIReader()),
 	)
 
 	for _, k := range Kinds() {
@@ -84,7 +90,11 @@ func Setup(mgr ctrl.Manager, log logging.Logger, o SetupOptions) error {
 		if err := ctrl.NewControllerManagedBy(mgr).
 			Named("shard-assigner-"+k.Name).
 			For(k.New()).
-			Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(enqueueAll(mgr.GetClient(), k, o.ConfigRef, log))).
+			// Shard Deployments are the desired state. Argo scaling one to
+			// zero, or pruning it, arrives here as an update or delete and
+			// re-evaluates every Workspace - the same job the old ConfigMap
+			// watch did, without a second object to drift from this one.
+			Watches(&appsv1.Deployment{}, handler.EnqueueRequestsFromMapFunc(enqueueAll(mgr.GetClient(), k, o.Namespace, log))).
 			// One worker per kind. Placement is a low-rate control loop and
 			// the decision is serialised anyway; extra workers would only
 			// add contention on the placement lock.
@@ -97,16 +107,19 @@ func Setup(mgr ctrl.Manager, log logging.Logger, o SetupOptions) error {
 	return mgr.Add(&census{placer: placer, interval: o.CensusInterval, log: log})
 }
 
-// enqueueAll maps a change to the config ConfigMap onto every Workspace of one
-// kind, so a shardCount or draining edit is re-evaluated everywhere.
-func enqueueAll(kube client.Client, k Kind, cfgRef types.NamespacedName, log logging.Logger) handler.MapFunc {
+// enqueueAll maps a change to a shard Deployment onto every Workspace of one
+// kind, so a scale-to-zero or a prune is re-evaluated everywhere.
+func enqueueAll(kube client.Client, k Kind, namespace string, log logging.Logger) handler.MapFunc {
 	return func(ctx context.Context, o client.Object) []reconcile.Request {
-		if o.GetNamespace() != cfgRef.Namespace || o.GetName() != cfgRef.Name {
+		if o.GetNamespace() != namespace {
+			return nil
+		}
+		if _, ok := o.GetLabels()[ShardLabel]; !ok {
 			return nil
 		}
 		l := k.NewList()
 		if err := kube.List(ctx, l); err != nil {
-			log.Info("Cannot list workspaces after a shard config change", "kind", k.Name, "error", err)
+			log.Info("Cannot list workspaces after a shard deployment change", "kind", k.Name, "error", err)
 			return nil
 		}
 		items := k.Items(l)
@@ -117,7 +130,8 @@ func enqueueAll(kube client.Client, k Kind, cfgRef types.NamespacedName, log log
 				Name:      ws.GetName(),
 			}})
 		}
-		log.Debug("Shard config changed; re-evaluating every workspace", "kind", k.Name, "count", len(reqs))
+		log.Debug("Shard deployment changed; re-evaluating every workspace",
+			"kind", k.Name, "deployment", o.GetName(), "count", len(reqs))
 		return reqs
 	}
 }
@@ -146,35 +160,35 @@ func (c *census) Start(ctx context.Context) error {
 }
 
 func (c *census) run(ctx context.Context) {
-	cfg, err := c.placer.LoadConfig(ctx)
+	fleet, err := c.placer.LoadFleet(ctx)
 	if err != nil {
-		c.log.Info("Cannot load shard config for census", "error", err)
+		c.log.Info("Cannot load the shard fleet for census", "error", err)
 		return
 	}
-	got, err := c.placer.Census(ctx, cfg)
+	got, err := c.placer.Census(ctx, fleet)
 	if err != nil {
 		c.log.Info("Cannot take workspace census", "error", err)
 		return
 	}
 	record(got)
 
-	// Refresh the drain-blocked gauge here too, not only from Reconcile: a
-	// drain that is blocked has few reconciles left to drive it, and this is
-	// the signal telling an operator to scale that Deployment to zero.
-	if !c.placer.requireOffline {
-		return
-	}
 	online, err := c.placer.OnlineShards(ctx)
 	if err != nil {
 		c.log.Info("Cannot determine which shards are running", "error", err)
 		return
 	}
-	for shard := range cfg.Draining {
-		blocked := 0.0
-		if online[shard] {
-			blocked = 1
+
+	// An active shard with no running pod is desired-state-says-alive,
+	// reality-says-dead: crash-looping, unschedulable, or stuck. Nothing else
+	// catches it, because its Workspaces do carry a label and that label does
+	// point at an active shard. Report it and let a human decide - migrating
+	// automatically would make every rolling restart look like a dead shard.
+	for _, s := range fleet.ActiveShards() {
+		missing := 0.0
+		if !online[s] {
+			missing = 1
 		}
-		ShardDrainBlocked.WithLabelValues(shard).Set(blocked)
+		ShardWithoutPods.WithLabelValues(s).Set(missing)
 	}
 }
 

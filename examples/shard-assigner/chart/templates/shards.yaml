@@ -1,0 +1,68 @@
+{{- $root := . -}}
+{{- range $i := until (int .Values.shardCount) }}
+{{- $shard := printf "shard-%d" $i }}
+{{- $replicas := 1 }}
+{{- if has $shard $root.Values.draining }}{{ $replicas = 0 }}{{ end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provider-terraform-{{ $shard }}
+  namespace: {{ $root.Values.namespace }}
+  labels:
+    app: provider-terraform
+    # REQUIRED on the Deployment itself. This is how the assigner discovers
+    # which shards exist and reads spec.replicas as their desired state.
+    terraform.crossplane.io/shard: {{ $shard }}
+spec:
+  replicas: {{ $replicas }}
+  # No surge: two pods with the same --shard-name would both reconcile the same
+  # Workspaces during a rollout.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: provider-terraform
+      terraform.crossplane.io/shard: {{ $shard }}
+  template:
+    metadata:
+      labels:
+        app: provider-terraform
+        # REQUIRED on the pod template. This is how a migration knows the old
+        # shard's process is gone before relabelling its Workspaces.
+        terraform.crossplane.io/shard: {{ $shard }}
+    spec:
+      serviceAccountName: {{ $root.Values.serviceAccountName }}
+      terminationGracePeriodSeconds: {{ $root.Values.terminationGracePeriodSeconds }}
+      securityContext:
+        fsGroup: 2000
+      containers:
+        - name: package-runtime
+          image: {{ $root.Values.image }}
+          args:
+            - -d
+            - --poll={{ $root.Values.pollInterval }}
+            - --max-reconcile-rate={{ $root.Values.maxReconcileRate }}
+            - --shard-name={{ $shard }}
+            - --graceful-shutdown-timeout={{ $root.Values.gracefulShutdownTimeout }}
+            # Required: without it, replicas > 1 on one shard would mean two
+            # processes reconciling the same Workspaces instead of
+            # active/passive. The lease ID carries the shard name.
+            - --leader-election
+          envFrom:
+            - secretRef:
+                name: crossplane-secrets
+          ports:
+            - name: metrics
+              containerPort: 8080
+          volumeMounts:
+            - mountPath: /tf
+              name: workdir
+              subPath: tf
+            - mountPath: /logs
+              name: workdir
+              subPath: logs
+      volumes:
+        - name: workdir
+          emptyDir: {}
+{{- end }}

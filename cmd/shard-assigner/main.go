@@ -32,7 +32,6 @@ import (
 	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
 	zapuber "go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -52,8 +51,7 @@ func main() {
 
 		leaderElection = app.Flag("leader-election", "Use leader election for the assigner.").Short('l').Default("true").OverrideDefaultFromEnvar("LEADER_ELECTION").Bool()
 
-		configNamespace = app.Flag("config-namespace", "Namespace of the ConfigMap holding shardCount and draining.").Default("crossplane-system").String()
-		configName      = app.Flag("config-name", "Name of the ConfigMap holding shardCount and draining.").Default("provider-terraform-shards").String()
+		namespace = app.Flag("namespace", "Namespace the shard Deployments and their pods run in.").Default("crossplane-system").String()
 
 		syncInterval   = app.Flag("sync-interval", "How often the informer cache is resynced, which re-evaluates placement for every Workspace.").Default("10m").Duration()
 		staleMigration = app.Flag("stale-migration", "How long a Workspace that never syncs on its new shard may block further migrations.").Default("30m").Duration()
@@ -61,7 +59,7 @@ func main() {
 
 		metricsBind = app.Flag("metrics-bind-address", "Address the metrics endpoint binds to.").Default(":8080").String()
 
-		podNamespace        = app.Flag("pod-namespace", "Namespace the sharded provider Deployments run in.").Default("crossplane-system").String()
+		migrationBatch      = app.Flag("migration-batch", "How many Workspaces may migrate at once. Overlap is not the concern - a migration only starts once the old shard's pod is gone - but a whole shard's Workspaces arriving together would pile up on the receiving shards' terraform plugin-cache lock.").Default("5").Int()
 		requireShardOffline = app.Flag("require-shard-offline", "Refuse to migrate a Workspace while its current shard still has a running pod. Shards are separate processes, so a shard listed in draining may still be mid-apply; moving a Workspace off it lets two terraform processes write the same remote state. Only set this false if the Terraform backend is confirmed to lock state (S3 with a DynamoDB table or use_lockfile, GCS, azurerm).").Default("true").Bool()
 	)
 	kingpin.MustParse(app.Parse(os.Args[1:]))
@@ -104,15 +102,16 @@ func main() {
 	kingpin.FatalIfError(err, "Cannot create controller manager")
 
 	kingpin.FatalIfError(shard.Setup(mgr, log, shard.SetupOptions{
-		ConfigRef:           types.NamespacedName{Namespace: *configNamespace, Name: *configName},
+		Namespace:           *namespace,
 		StaleMigration:      *staleMigration,
+		MigrationBatch:      *migrationBatch,
 		CensusInterval:      *censusInterval,
-		PodNamespace:        *podNamespace,
 		RequireShardOffline: *requireShardOffline,
 	}), "Cannot setup shard assigner")
 
 	log.Info("Starting shard assigner",
-		"config", *configNamespace+"/"+*configName,
+		"namespace", *namespace,
+		"migration-batch", *migrationBatch,
 		"sync-interval", syncInterval.String(),
 		"stale-migration", staleMigration.String(),
 		"require-shard-offline", *requireShardOffline)

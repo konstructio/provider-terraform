@@ -44,9 +44,30 @@ spec:
           annotations:
             summary: A draining shard still has a running pod
             description: >-
-              Shard {{ $labels.shard }} is listed in `draining` but still has a
-              running pod, so the assigner will not migrate its Workspaces.
-              Scale that shard's Deployment to zero to let the drain proceed.
+              Shard {{ $labels.shard }} is being drained or removed but still
+              has a running pod, so the assigner will not migrate its
+              Workspaces - two terraform processes would write the same state.
+              Normally this clears itself once the pod finishes terminating; if
+              it does not, that pod is stuck.
+
+        # Desired state says alive, reality says dead. Nothing else catches
+        # this: the Workspaces do have a label, and it does point at an active
+        # shard, so they look correctly placed while being reconciled by
+        # nobody.
+        - alert: TerraformShardWithoutPods
+          expr: terraform_shard_without_pods > 0
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: An active shard has no running pod
+            description: >-
+              Shard {{ $labels.shard }} has a Deployment asking for replicas but
+              no running pod - crash-looping, unschedulable, or stuck. Its
+              Workspaces are not being reconciled by anything. The assigner will
+              not move them automatically, because that would make every rolling
+              restart look like a dead shard. Fix the pod, or set that shard's
+              replicas to 0 to have its Workspaces migrated away.
 
         - alert: TerraformShardMigrationStalled
           expr: terraform_shard_workspaces_migrating > 0
@@ -58,8 +79,8 @@ spec:
             description: >-
               A Workspace has carried terraform.crossplane.io/migrating-at for
               over 30 minutes without reaching Synced=True on its new shard.
-              Past this cutoff the assigner stops letting it block the drain and
-              moves on, so check why that Workspace is not syncing.
+              Past this cutoff the assigner stops letting it hold a batch slot
+              and moves on, so check why that Workspace is not syncing.
 
         - alert: TerraformShardImbalance
           expr: >-

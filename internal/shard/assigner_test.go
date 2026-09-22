@@ -26,6 +26,7 @@ import (
 	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
 	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 	"github.com/google/go-cmp/cmp"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -40,10 +41,31 @@ import (
 	namespacedv1beta1 "github.com/upbound/provider-terraform/apis/namespaced/v1beta1"
 )
 
-var (
-	testConfigRef = types.NamespacedName{Namespace: "crossplane-system", Name: "provider-terraform-shards"}
-	testNow       = time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
-)
+const testNamespace = "crossplane-system"
+
+var testNow = time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+
+// shardDeploy builds a shard Deployment. replicas is what makes it active:
+// 0 means draining, and no Deployment at all means removed.
+func shardDeploy(shard string, replicas int32) appsv1.Deployment {
+	return appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNamespace,
+			Name:      "provider-terraform-" + shard,
+			Labels:    map[string]string{ShardLabel: shard},
+		},
+		Spec: appsv1.DeploymentSpec{Replicas: &replicas},
+	}
+}
+
+// shardDeploys builds one scaled-up Deployment per named shard.
+func shardDeploys(shards ...string) []appsv1.Deployment {
+	out := make([]appsv1.Deployment, 0, len(shards))
+	for _, s := range shards {
+		out = append(out, shardDeploy(s, 1))
+	}
+	return out
+}
 
 // cws builds a cluster-scoped Workspace with the given shard label.
 func cws(name, shard string, opts ...func(client.Object)) clusterv1beta1.Workspace {
@@ -116,11 +138,22 @@ func shardPods(shards ...string) []corev1.Pod {
 	return out
 }
 
+// migratingWorkspaces builds n Workspaces already mid-migration on shard-0,
+// each occupying a batch slot unless the extra options say otherwise.
+func migratingWorkspaces(n int, opts ...func(client.Object)) []clusterv1beta1.Workspace {
+	out := make([]clusterv1beta1.Workspace, 0, n)
+	for i := range n {
+		o := append([]func(client.Object){migrating(testNow.Add(-1 * time.Minute))}, opts...)
+		out = append(out, cws(fmt.Sprintf("busy-%d", i), "shard-0", o...))
+	}
+	return out
+}
+
 // fixture is the simulated cluster the mock client serves.
 type fixture struct {
-	config     map[string]string
-	cluster    []clusterv1beta1.Workspace
-	namespaced []namespacedv1beta1.Workspace
+	deployments []appsv1.Deployment
+	cluster     []clusterv1beta1.Workspace
+	namespaced  []namespacedv1beta1.Workspace
 
 	// pods is the set of shard pods. Nil means "the default": a running pod
 	// for every active shard, so a draining or out-of-range shard reads as
@@ -133,12 +166,6 @@ func (f fixture) kube(patched *[]client.Object) *test.MockClient {
 	return &test.MockClient{
 		MockGet: func(_ context.Context, key client.ObjectKey, obj client.Object) error {
 			switch o := obj.(type) {
-			case *corev1.ConfigMap:
-				if f.config == nil {
-					return apierrors.NewNotFound(schema.GroupResource{Resource: "configmaps"}, key.Name)
-				}
-				o.Data = f.config
-				return nil
 			case *clusterv1beta1.Workspace:
 				for i := range f.cluster {
 					if f.cluster[i].Name == key.Name {
@@ -164,6 +191,8 @@ func (f fixture) kube(patched *[]client.Object) *test.MockClient {
 				l.Items = append([]namespacedv1beta1.Workspace(nil), f.namespaced...)
 			case *corev1.PodList:
 				l.Items = append([]corev1.Pod(nil), f.pods...)
+			case *appsv1.DeploymentList:
+				l.Items = append([]appsv1.Deployment(nil), f.deployments...)
 			}
 			return nil
 		},
@@ -180,9 +209,10 @@ func testAssigner(f fixture, k Kind, patched *[]client.Object, o ...PlacerOption
 	kube := f.kube(patched)
 	o = append([]PlacerOption{
 		WithClock(func() time.Time { return testNow }),
-		WithPodReader(kube, "crossplane-system"),
+		WithPodReader(kube),
+		WithNamespace(testNamespace),
 	}, o...)
-	p := NewPlacer(kube, testConfigRef, logging.NewNopLogger(), o...)
+	p := NewPlacer(kube, logging.NewNopLogger(), o...)
 	return NewAssigner(kube, k, p, logging.NewNopLogger())
 }
 
@@ -208,7 +238,7 @@ func TestReconcile(t *testing.T) {
 		"UnlabelledGetsLeastLoaded": {
 			reason: "An unplaced Workspace lands on the emptiest active shard.",
 			fixture: fixture{
-				config: map[string]string{KeyShardCount: "3"},
+				deployments: shardDeploys("shard-0", "shard-1", "shard-2"),
 				cluster: []clusterv1beta1.Workspace{
 					cws("a", "shard-0"), cws("b", "shard-0"), cws("c", "shard-1"), cws("new", ""),
 				},
@@ -219,8 +249,8 @@ func TestReconcile(t *testing.T) {
 		"AlreadyActiveIsNoOp": {
 			reason: "The happy path writes nothing at all - placement is sticky.",
 			fixture: fixture{
-				config:  map[string]string{KeyShardCount: "3"},
-				cluster: []clusterv1beta1.Workspace{cws("a", "shard-2")},
+				deployments: shardDeploys("shard-0", "shard-1", "shard-2"),
+				cluster:     []clusterv1beta1.Workspace{cws("a", "shard-2")},
 			},
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
 			want: want{patches: 0},
@@ -228,8 +258,8 @@ func TestReconcile(t *testing.T) {
 		"DrainingShardMigrates": {
 			reason: "A Workspace on a draining shard moves, and is stamped migrating-at.",
 			fixture: fixture{
-				config:  map[string]string{KeyShardCount: "2", KeyDraining: "shard-1"},
-				cluster: []clusterv1beta1.Workspace{cws("a", "shard-1")},
+				deployments: append(shardDeploys("shard-0"), shardDeploy("shard-1", 0)),
+				cluster:     []clusterv1beta1.Workspace{cws("a", "shard-1")},
 			},
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
 			want: want{shard: "shard-0", migratingSet: true, patches: 1},
@@ -237,56 +267,74 @@ func TestReconcile(t *testing.T) {
 		"OutOfRangeShardMigrates": {
 			reason: "Dropping shardCount moves Workspaces off the shards that no longer exist.",
 			fixture: fixture{
-				config:  map[string]string{KeyShardCount: "2"},
-				cluster: []clusterv1beta1.Workspace{cws("a", "shard-5")},
+				deployments: shardDeploys("shard-0", "shard-1"),
+				cluster:     []clusterv1beta1.Workspace{cws("a", "shard-5")},
 			},
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
 			want: want{shard: "shard-0", migratingSet: true, patches: 1},
 		},
-		"MigrationInFlightBlocksAnother": {
-			reason: "Migrations are serialised, so a second one waits rather than doubling the overlap.",
+		"FullBatchBlocksAnother": {
+			reason: "The batch caps how many Workspaces land on the receiving shards at once; a full batch makes the next one wait.",
 			fixture: fixture{
-				config: map[string]string{KeyShardCount: "2", KeyDraining: "shard-1"},
-				cluster: []clusterv1beta1.Workspace{
-					cws("busy", "shard-0", migrating(testNow.Add(-1*time.Minute))),
+				deployments: append(shardDeploys("shard-0"), shardDeploy("shard-1", 0)),
+				cluster: append(migratingWorkspaces(DefaultMigrationBatch),
 					cws("waiting", "shard-1"),
-				},
+				),
 			},
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "waiting"}},
 			want: want{result: reconcile.Result{RequeueAfter: RequeueMigration}, patches: 0},
 		},
+		"PartialBatchAdmitsAnother": {
+			reason: "Below the batch limit the next migration starts immediately; serialising one at a time would make a large drain take hours.",
+			fixture: fixture{
+				deployments: append(shardDeploys("shard-0"), shardDeploy("shard-1", 0)),
+				cluster: append(migratingWorkspaces(DefaultMigrationBatch-1),
+					cws("waiting", "shard-1"),
+				),
+			},
+			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "waiting"}},
+			want: want{shard: "shard-0", migratingSet: true, patches: 1},
+		},
+		"SyncedMigrationsDoNotHoldBatchSlots": {
+			reason: "A migration that has landed no longer occupies a slot, even before its annotation is cleared.",
+			fixture: fixture{
+				deployments: append(shardDeploys("shard-0"), shardDeploy("shard-1", 0)),
+				cluster: append(migratingWorkspaces(DefaultMigrationBatch, synced()),
+					cws("waiting", "shard-1"),
+				),
+			},
+			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "waiting"}},
+			want: want{shard: "shard-0", migratingSet: true, patches: 1},
+		},
 		"MigrationInFlightDoesNotBlockFirstPlacement": {
 			reason: "An unlabelled Workspace is reconciled by nobody, so it is placed even mid-drain.",
 			fixture: fixture{
-				config: map[string]string{KeyShardCount: "2", KeyDraining: "shard-1"},
-				cluster: []clusterv1beta1.Workspace{
-					cws("busy", "shard-0", migrating(testNow.Add(-1*time.Minute))),
+				deployments: append(shardDeploys("shard-0"), shardDeploy("shard-1", 0)),
+				cluster: append(migratingWorkspaces(DefaultMigrationBatch),
 					cws("new", ""),
-				},
+				),
 			},
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "new"}},
 			want: want{shard: "shard-0", patches: 1},
 		},
 		"StaleMigrationStopsBlocking": {
-			reason: "A migration that never syncs must not wedge the drain forever.",
+			reason: "Migrations that never sync must not hold batch slots forever, or one broken Workspace wedges the whole drain.",
 			fixture: fixture{
-				config: map[string]string{KeyShardCount: "2", KeyDraining: "shard-1"},
-				cluster: []clusterv1beta1.Workspace{
-					cws("stuck", "shard-0", migrating(testNow.Add(-31*time.Minute))),
+				deployments: append(shardDeploys("shard-0"), shardDeploy("shard-1", 0)),
+				cluster: append(migratingWorkspaces(DefaultMigrationBatch, migratingRaw(testNow.Add(-31*time.Minute).UTC().Format(time.RFC3339))),
 					cws("waiting", "shard-1"),
-				},
+				),
 			},
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "waiting"}},
 			want: want{shard: "shard-0", migratingSet: true, patches: 1},
 		},
 		"UnparseableMigrationStopsBlocking": {
-			reason: "A corrupt annotation must not wedge the drain either.",
+			reason: "Corrupt annotations must not hold batch slots either.",
 			fixture: fixture{
-				config: map[string]string{KeyShardCount: "2", KeyDraining: "shard-1"},
-				cluster: []clusterv1beta1.Workspace{
-					cws("corrupt", "shard-0", migratingRaw("not-a-timestamp")),
+				deployments: append(shardDeploys("shard-0"), shardDeploy("shard-1", 0)),
+				cluster: append(migratingWorkspaces(DefaultMigrationBatch, migratingRaw("not-a-timestamp")),
 					cws("waiting", "shard-1"),
-				},
+				),
 			},
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "waiting"}},
 			want: want{shard: "shard-0", migratingSet: true, patches: 1},
@@ -294,8 +342,8 @@ func TestReconcile(t *testing.T) {
 		"SyncedMigrationClearsAnnotation": {
 			reason: "Reaching Synced=True on the new shard completes the migration and releases the gate.",
 			fixture: fixture{
-				config:  map[string]string{KeyShardCount: "2"},
-				cluster: []clusterv1beta1.Workspace{cws("a", "shard-0", migrating(testNow.Add(-1*time.Minute)), synced())},
+				deployments: shardDeploys("shard-0", "shard-1"),
+				cluster:     []clusterv1beta1.Workspace{cws("a", "shard-0", migrating(testNow.Add(-1*time.Minute)), synced())},
 			},
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
 			want: want{shard: "shard-0", patches: 1},
@@ -303,8 +351,8 @@ func TestReconcile(t *testing.T) {
 		"UnsyncedMigrationKeepsAnnotation": {
 			reason: "The annotation stays until the Workspace actually syncs on its new shard.",
 			fixture: fixture{
-				config:  map[string]string{KeyShardCount: "2"},
-				cluster: []clusterv1beta1.Workspace{cws("a", "shard-0", migrating(testNow.Add(-1*time.Minute)))},
+				deployments: shardDeploys("shard-0", "shard-1"),
+				cluster:     []clusterv1beta1.Workspace{cws("a", "shard-0", migrating(testNow.Add(-1*time.Minute)))},
 			},
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
 			want: want{patches: 0},
@@ -312,8 +360,8 @@ func TestReconcile(t *testing.T) {
 		"DeletingIsLeftAlone": {
 			reason: "Taking the label off a deleting Workspace would strand its destroy with no owner.",
 			fixture: fixture{
-				config:  map[string]string{KeyShardCount: "2", KeyDraining: "shard-1"},
-				cluster: []clusterv1beta1.Workspace{cws("a", "shard-1", deleting())},
+				deployments: append(shardDeploys("shard-0"), shardDeploy("shard-1", 0)),
+				cluster:     []clusterv1beta1.Workspace{cws("a", "shard-1", deleting())},
 			},
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
 			want: want{patches: 0},
@@ -321,8 +369,8 @@ func TestReconcile(t *testing.T) {
 		"GoneIsNotAnError": {
 			reason: "A Workspace deleted between the event and the Get is not an error.",
 			fixture: fixture{
-				config:  map[string]string{KeyShardCount: "2"},
-				cluster: []clusterv1beta1.Workspace{},
+				deployments: shardDeploys("shard-0", "shard-1"),
+				cluster:     []clusterv1beta1.Workspace{},
 			},
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "missing"}},
 			want: want{patches: 0},
@@ -330,8 +378,8 @@ func TestReconcile(t *testing.T) {
 		"MissingConfigIsAnError": {
 			reason: "Without desired state the assigner must not guess a placement.",
 			fixture: fixture{
-				config:  nil,
-				cluster: []clusterv1beta1.Workspace{cws("a", "")},
+				deployments: nil,
+				cluster:     []clusterv1beta1.Workspace{cws("a", "")},
 			},
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
 			want: want{wantErr: true},
@@ -339,8 +387,8 @@ func TestReconcile(t *testing.T) {
 		"EverythingDrainingIsAnError": {
 			reason: "With nowhere to place, the assigner errors rather than picking a draining shard.",
 			fixture: fixture{
-				config:  map[string]string{KeyShardCount: "2", KeyDraining: "shard-0,shard-1"},
-				cluster: []clusterv1beta1.Workspace{cws("a", "")},
+				deployments: []appsv1.Deployment{shardDeploy("shard-0", 0), shardDeploy("shard-1", 0)},
+				cluster:     []clusterv1beta1.Workspace{cws("a", "")},
 			},
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
 			want: want{wantErr: true},
@@ -348,9 +396,9 @@ func TestReconcile(t *testing.T) {
 		"SourceShardStillRunningBlocksMigration": {
 			reason: "Shards are separate processes. Moving a Workspace off a shard whose pod is alive lets two terraform processes write the same remote state, which an unlocked backend will not stop.",
 			fixture: fixture{
-				config:  map[string]string{KeyShardCount: "2", KeyDraining: "shard-1"},
-				cluster: []clusterv1beta1.Workspace{cws("a", "shard-1")},
-				pods:    shardPods("shard-0", "shard-1"),
+				deployments: append(shardDeploys("shard-0"), shardDeploy("shard-1", 0)),
+				cluster:     []clusterv1beta1.Workspace{cws("a", "shard-1")},
+				pods:        shardPods("shard-0", "shard-1"),
 			},
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
 			want: want{result: reconcile.Result{RequeueAfter: RequeueShardOnline}, patches: 0},
@@ -358,9 +406,9 @@ func TestReconcile(t *testing.T) {
 		"SourceShardScaledToZeroMigrates": {
 			reason: "Once the draining shard's pod is gone there is no second writer, so the migration is safe to make.",
 			fixture: fixture{
-				config:  map[string]string{KeyShardCount: "2", KeyDraining: "shard-1"},
-				cluster: []clusterv1beta1.Workspace{cws("a", "shard-1")},
-				pods:    shardPods("shard-0"),
+				deployments: append(shardDeploys("shard-0"), shardDeploy("shard-1", 0)),
+				cluster:     []clusterv1beta1.Workspace{cws("a", "shard-1")},
+				pods:        shardPods("shard-0"),
 			},
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
 			want: want{shard: "shard-0", migratingSet: true, patches: 1},
@@ -368,8 +416,8 @@ func TestReconcile(t *testing.T) {
 		"TerminatedShardPodCountsAsOffline": {
 			reason: "A pod whose containers have all terminated is running no terraform, so it must not block the drain forever.",
 			fixture: fixture{
-				config:  map[string]string{KeyShardCount: "2", KeyDraining: "shard-1"},
-				cluster: []clusterv1beta1.Workspace{cws("a", "shard-1")},
+				deployments: append(shardDeploys("shard-0"), shardDeploy("shard-1", 0)),
+				cluster:     []clusterv1beta1.Workspace{cws("a", "shard-1")},
 				pods: append(shardPods("shard-0"), corev1.Pod{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace: "crossplane-system", Name: "old-shard-1",
@@ -384,9 +432,9 @@ func TestReconcile(t *testing.T) {
 		"UnlabelledShardPodsFailClosed": {
 			reason: "No shard-labelled pods is what a missing pod-template label looks like; reading it as 'everything is offline' would defeat the check exactly when it matters.",
 			fixture: fixture{
-				config:  map[string]string{KeyShardCount: "2", KeyDraining: "shard-1"},
-				cluster: []clusterv1beta1.Workspace{cws("a", "shard-1")},
-				pods:    []corev1.Pod{},
+				deployments: append(shardDeploys("shard-0"), shardDeploy("shard-1", 0)),
+				cluster:     []clusterv1beta1.Workspace{cws("a", "shard-1")},
+				pods:        []corev1.Pod{},
 			},
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
 			want: want{wantErr: true},
@@ -394,9 +442,9 @@ func TestReconcile(t *testing.T) {
 		"RequireOfflineDisabledMigratesWhileRunning": {
 			reason: "With backend locking confirmed, an operator may opt back into migrating off a live shard.",
 			fixture: fixture{
-				config:  map[string]string{KeyShardCount: "2", KeyDraining: "shard-1"},
-				cluster: []clusterv1beta1.Workspace{cws("a", "shard-1")},
-				pods:    shardPods("shard-0", "shard-1"),
+				deployments: append(shardDeploys("shard-0"), shardDeploy("shard-1", 0)),
+				cluster:     []clusterv1beta1.Workspace{cws("a", "shard-1")},
+				pods:        shardPods("shard-0", "shard-1"),
 			},
 			placerOpts: []PlacerOption{WithRequireShardOffline(false)},
 			req:        reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
@@ -405,9 +453,9 @@ func TestReconcile(t *testing.T) {
 		"FirstPlacementIgnoresShardLiveness": {
 			reason: "An unplaced Workspace has no current shard, so there is no second writer to wait for.",
 			fixture: fixture{
-				config:  map[string]string{KeyShardCount: "2", KeyDraining: "shard-1"},
-				cluster: []clusterv1beta1.Workspace{cws("new", "")},
-				pods:    shardPods("shard-0", "shard-1"),
+				deployments: append(shardDeploys("shard-0"), shardDeploy("shard-1", 0)),
+				cluster:     []clusterv1beta1.Workspace{cws("new", "")},
+				pods:        shardPods("shard-0", "shard-1"),
 			},
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "new"}},
 			want: want{shard: "shard-0", patches: 1},
@@ -415,8 +463,8 @@ func TestReconcile(t *testing.T) {
 		"BalancesAcrossBothKinds": {
 			reason: "A shard reconciles both Workspace kinds, so load must be counted across both.",
 			fixture: fixture{
-				config:  map[string]string{KeyShardCount: "2"},
-				cluster: []clusterv1beta1.Workspace{cws("new", "")},
+				deployments: shardDeploys("shard-0", "shard-1"),
+				cluster:     []clusterv1beta1.Workspace{cws("new", "")},
 				namespaced: []namespacedv1beta1.Workspace{
 					nws("ns", "a", "shard-0"), nws("ns", "b", "shard-0"), nws("ns", "c", "shard-1"),
 				},
@@ -430,14 +478,18 @@ func TestReconcile(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f := tc.fixture
 			if f.pods == nil {
-				// Default: a pod for every shard that is still active, so a
-				// draining or out-of-range shard reads as offline.
-				cfg, err := ParseConfig(f.config)
-				if err == nil {
-					f.pods = shardPods(cfg.ActiveShards()...)
-				} else {
-					f.pods = shardPods("shard-0")
+				// Default: a pod for every shard whose Deployment is scaled
+				// up, so a drained or removed shard reads as offline.
+				active := make([]string, 0, len(f.deployments))
+				for _, d := range f.deployments {
+					if d.Spec.Replicas != nil && *d.Spec.Replicas > 0 {
+						active = append(active, d.Labels[ShardLabel])
+					}
 				}
+				if len(active) == 0 {
+					active = []string{"shard-0"}
+				}
+				f.pods = shardPods(active...)
 			}
 			var patched []client.Object
 			a := testAssigner(f, ClusterKind(), &patched, tc.placerOpts...)
@@ -475,7 +527,7 @@ func TestReconcile(t *testing.T) {
 
 func TestReconcileNamespacedKind(t *testing.T) {
 	f := fixture{
-		config: map[string]string{KeyShardCount: "2"},
+		deployments: shardDeploys("shard-0", "shard-1"),
 		namespaced: []namespacedv1beta1.Workspace{
 			nws("ns", "a", "shard-0"), nws("ns", "new", ""),
 		},
@@ -498,16 +550,16 @@ func TestReconcileNamespacedKind(t *testing.T) {
 }
 
 func TestLeastLoadedTieBreak(t *testing.T) {
-	f := fixture{config: map[string]string{KeyShardCount: "3"}}
+	f := fixture{deployments: shardDeploys("shard-0", "shard-1", "shard-2"), pods: shardPods("shard-0", "shard-1", "shard-2")}
 	kube := f.kube(nil)
-	p := NewPlacer(kube, testConfigRef, logging.NewNopLogger(),
-		WithClock(func() time.Time { return testNow }), WithPodReader(kube, "crossplane-system"))
+	p := NewPlacer(kube, logging.NewNopLogger(),
+		WithClock(func() time.Time { return testNow }), WithPodReader(kube), WithNamespace(testNamespace))
 
-	cfg, err := p.LoadConfig(context.Background())
+	fleet, err := p.LoadFleet(context.Background())
 	if err != nil {
-		t.Fatalf("LoadConfig(...): %v", err)
+		t.Fatalf("LoadFleet(...): %v", err)
 	}
-	got, err := p.LeastLoaded(context.Background(), cfg)
+	got, err := p.LeastLoaded(context.Background(), fleet)
 	if err != nil {
 		t.Fatalf("LeastLoaded(...): %v", err)
 	}
@@ -518,7 +570,7 @@ func TestLeastLoadedTieBreak(t *testing.T) {
 
 func TestCensus(t *testing.T) {
 	f := fixture{
-		config: map[string]string{KeyShardCount: "2", KeyDraining: "shard-1"},
+		deployments: append(shardDeploys("shard-0"), shardDeploy("shard-1", 0)),
 		cluster: []clusterv1beta1.Workspace{
 			cws("a", "shard-0"),
 			cws("b", "shard-1"),
@@ -528,14 +580,14 @@ func TestCensus(t *testing.T) {
 		},
 	}
 	kube := f.kube(nil)
-	p := NewPlacer(kube, testConfigRef, logging.NewNopLogger(),
-		WithClock(func() time.Time { return testNow }), WithPodReader(kube, "crossplane-system"))
+	p := NewPlacer(kube, logging.NewNopLogger(),
+		WithClock(func() time.Time { return testNow }), WithPodReader(kube), WithNamespace(testNamespace))
 
-	cfg, err := p.LoadConfig(context.Background())
+	fleet, err := p.LoadFleet(context.Background())
 	if err != nil {
-		t.Fatalf("LoadConfig(...): %v", err)
+		t.Fatalf("LoadFleet(...): %v", err)
 	}
-	got, err := p.Census(context.Background(), cfg)
+	got, err := p.Census(context.Background(), fleet)
 	if err != nil {
 		t.Fatalf("Census(...): %v", err)
 	}

@@ -81,15 +81,14 @@ Three properties worth knowing:
   If it were, every rolling update, OOM kill, node drain and eviction would look
   like a scale-down and trigger a spurious reshuffle.
 - **Labels are sticky.** A Workspace is relabelled only when it is unplaced, or
-  when its shard is draining or has fallen out of range. Normal operation never
-  relabels.
+  when its shard stops being active. Normal operation never relabels.
 - **A Workspace is never moved off a shard whose pod is still running.** This
   is the important one, and it is why the drain procedure below looks the way
   it does.
 
-  Shards are separate pods, so separate processes. A shard appearing in
-  `draining` says nothing about whether its process is still running — it may
-  be mid-`terraform apply` right now. Relabel a Workspace off it and two
+  Shards are separate pods, so separate processes. A Deployment scaled to zero
+  or pruned says nothing about whether its pod is still running — it may be
+  mid-`terraform apply` right now. Relabel a Workspace off it and two
   independent `terraform` processes are writing the same remote state. If that
   backend does not lock, nothing stops them: it is not a lock-contention error
   you can retry, it is a silent clobber.
@@ -100,6 +99,13 @@ Three properties worth knowing:
   shard-labelled pods at all, and nothing migrates. That last case is what a
   missing pod-template label looks like, and reading it as "everything is
   offline" would disable the check exactly when it matters.
+
+  You cannot check this per-Workspace. A Crossplane managed resource has no
+  "reconcile in progress" condition — `Synced=True` reports the last result,
+  not whether one is running right now. "No process is acting as shard-3" is
+  knowable; "no process is acting on W1" is not. Which is why the gate is at
+  the shard level, and why the shard's process must fully drain *before* it
+  disappears.
 
   `--require-shard-offline=false` opts out, and is only reasonable with backend
   locking confirmed: S3 with a DynamoDB lock table or `use_lockfile = true`
@@ -113,75 +119,90 @@ Three properties worth knowing:
 
 ## Configuration
 
+There is no ConfigMap. The shard **Deployments** are the desired state:
+
+| State | Assigner reads it as |
+| --- | --- |
+| Deployment exists, `replicas > 0` | active, placeable |
+| Deployment exists, `replicas: 0` | draining — migrate its Workspaces away |
+| Deployment absent | removed — migrate its Workspaces away |
+
+`spec.replicas` is already desired state; mirroring it into a second object
+would only create something to drift from it. Expressing "draining" as
+`replicas: 0` also works for any shard, not just the highest-numbered one — a
+count can only remove from the top.
+
+The shard label appears in three places, doing three different jobs:
+
+- on a **Workspace** — the assignment itself
+- on a shard **Deployment's own labels** — how the assigner discovers the shard
+  exists and reads its replicas
+- on that Deployment's **pod template** — how a migration confirms the old
+  shard's process is gone
+
+Miss the second and the assigner sees no fleet. Miss the third and it cannot
+verify liveness and, failing closed, migrates nothing.
+
+[`examples/shard-assigner/chart/`](../examples/shard-assigner/chart/) renders
+all of it from one value:
+
 ```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: provider-terraform-shards
-  namespace: crossplane-system
-data:
-  shardCount: "4"
-  draining: "shard-3"   # comma-separated, optional
+shardCount: 4
+draining: []          # e.g. [shard-2] to drain one in the middle
 ```
 
-Active shards are `shard-0 .. shard-{shardCount-1}` minus anything in
-`draining`. Those names must match the `--shard-name` values on the provider
-Deployments. A change to this ConfigMap re-evaluates every Workspace.
+Argo needs an ignore rule on `/spec/replicas`, since the assigner patches it to
+drive a drain it started itself. Same thing you would do for an HPA.
 
-Manifests live in [`examples/shard-assigner/`](../examples/shard-assigner/):
-the assigner itself, and
-[`provider-shards.yaml`](../examples/shard-assigner/provider-shards.yaml) for
-the sharded provider instances.
+### Assigner flags
 
-> A Crossplane `Provider` resource manages exactly one Deployment, and
-> `replicas: N` on it is active/passive HA, not sharding. So shard-0 runs as
-> the Crossplane-managed instance via a `DeploymentRuntimeConfig` and the rest
-> run as ordinary Deployments beside it, reusing the package's ServiceAccount.
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--namespace` | `crossplane-system` | Where the shard Deployments and their pods live. |
+| `--require-shard-offline` | `true` | Refuse to migrate a Workspace while its current shard still has a running pod. |
+| `--migration-batch` | `5` | How many Workspaces may migrate at once. |
+| `--stale-migration` | `30m` | How long a Workspace that never syncs may hold a batch slot. |
 
 ## Operational procedures
 
 ### Scale up (4 → 5)
 
-1. Add the `shard-4` provider Deployment with `--shard-name=shard-4`.
-2. Set `shardCount: "5"`.
+Raise `shardCount`. A new Deployment appears; **existing Workspaces do not
+move**. Placement is least-loaded, so new Workspaces land on the empty shard.
+Rebalancing existing ones is a separate, deliberate action.
 
-New Workspaces start landing on shard-4 via least-loaded. **Existing Workspaces
-do not move.** Rebalancing is a separate, deliberate action — there is no
-automatic rebalance, by design.
+### Scale down (5 → 4)
 
-### Scale down (remove shard-3)
+Lower `shardCount` — one commit, and the sequence runs itself:
 
-1. Add `shard-3` to `draining`. The assigner stops placing new Workspaces
-   there, but does **not** move the ones it has yet.
-2. **Scale shard-3's Deployment to zero and wait for its pod to go away.**
-   Until then the assigner refuses to migrate anything off it, and
-   `terraform_shard_drain_blocked{shard="shard-3"}` is 1. Give it at least
-   `terminationGracePeriodSeconds` so any in-flight apply finishes cleanly
-   rather than being killed into a stale backend lock.
-3. With the pod gone, the assigner relabels shard-3's Workspaces **one at a
-   time**, waiting for each to reach `SYNCED=True` on its new shard before
-   starting the next. Watch `terraform_shard_workspaces_inactive_shard` fall.
-4. Once shard-3 owns nothing, drop `shardCount` to 3 and delete the Deployment.
+1. Argo prunes shard-4's Deployment. Its pod gets SIGTERM.
+2. The assigner sees shard-4 is no longer declared, so its Workspaces need
+   placement — but the liveness gate finds shard-4's pod still terminating and
+   **writes nothing**. `terraform_shard_drain_blocked{shard="shard-4"}` is 1.
+3. The pod drains: in-flight applies finish inside
+   `--graceful-shutdown-timeout`, bounded by `terminationGracePeriodSeconds`.
+   The pod goes away.
+4. The assigner migrates shard-4's Workspaces onto the survivors, `--migration-batch`
+   at a time, least-loaded.
 
-Note step 2 is the opposite of what you would do if the label alone were the
-safety mechanism. It is deliberate: shard-3's Workspaces sit unreconciled
-between steps 2 and 3, and that is strictly better than two `terraform`
-processes writing one state file. The `terraform_shard_drain_blocked` alert
-exists so a half-finished drain is visible rather than silent.
+You do not have to sequence anything. The ordering that matters — pod gone
+*before* relabel — is enforced by the gate, not by a runbook.
 
-Two ways to get this wrong:
+### Draining one shard in the middle
 
-- **Do not drop `shardCount` before draining.** Every Workspace on the removed
-  shard becomes out-of-range at once. They still will not move while its pod
-  runs, but you lose the explicit `draining` marker that says a drain is in
-  progress.
-- **Do not forget the pod-template label.** Every shard Deployment's pod
-  template needs `terraform.crossplane.io/shard: shard-N`. Without it the
-  assigner cannot verify liveness and, failing closed, migrates nothing.
+Add it to `draining` so it renders with `replicas: 0`. Same flow from step 2.
 
-A migration that never reaches `SYNCED=True` stops blocking the drain after
+### Why the batch is 5 and not 1
+
+Migrations only start once the old shard's pod is gone, so there is no handover
+overlap to serialise against. The batch exists purely so a drained shard's
+Workspaces do not arrive as one burst of `terraform init` on the receiving
+shards, which serialise on the provider's plugin-cache lock. Strictly one at a
+time would make a 40-Workspace drain take over an hour for no safety benefit.
+
+A migration that never reaches `SYNCED=True` stops holding its slot after
 `--stale-migration` (default 30m); the assigner logs loudly and moves on, so one
-permanently broken Workspace cannot wedge a drain forever.
+permanently broken Workspace cannot wedge a drain.
 
 ## Rollout
 
@@ -206,6 +227,7 @@ permanently broken Workspace cannot wedge a drain forever.
 | `terraform_shard_workspaces_inactive_shard` | gauge | Workspaces awaiting migration |
 | `terraform_shard_workspaces_migrating` | gauge | Migrations in flight |
 | `terraform_shard_drain_blocked{shard}` | gauge | 1 while a draining shard still has a running pod |
+| `terraform_shard_without_pods{shard}` | gauge | 1 while an active shard has no running pod |
 | `terraform_shard_migrations_started_total{from,to}` | counter | Relabels performed |
 | `terraform_shard_migrations_completed_total{shard}` | counter | Migrations that synced |
 
@@ -220,8 +242,13 @@ Workspace is reconciled by nobody and fails silently otherwise.
 
 ## Not built
 
-- **Automatic Deployment management for shards.** Adding a shard means adding a
-  Deployment and bumping `shardCount`; nothing reconciles the two together.
+- **Creating or deleting shard Deployments.** The assigner only ever patches
+  `spec.replicas` on a drain it started. Existence stays in GitOps, so image
+  upgrades and `git revert` keep working normally. If shard count ever needs to
+  autoscale on load, that is the piece to build.
+- **Automatic migration off a shard that is up but has no pods.** Reported via
+  `terraform_shard_without_pods` and alerted; doing it automatically would make
+  every rolling restart look like a dead shard.
 - **Cost-weighted placement.** Placement counts objects. `Placer.cost` is the
   seam for weighting by observed reconcile duration — the reason this is an
   assigner rather than a hash — but it returns 1 for everything today.

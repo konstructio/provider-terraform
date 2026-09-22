@@ -71,6 +71,17 @@ var (
 		[]string{"shard"},
 	)
 
+	// ShardWithoutPods is 1 while a shard whose Deployment asks for replicas
+	// has no running pod - crash-looping, unschedulable, or stuck. Its
+	// Workspaces are labelled to an active shard, so nothing else catches it.
+	ShardWithoutPods = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "terraform_shard_without_pods",
+			Help: "1 while an active shard has no running pod, so its Workspaces are unreconciled",
+		},
+		[]string{"shard"},
+	)
+
 	// MigrationsStarted counts relabels from one shard onto another.
 	MigrationsStarted = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -98,6 +109,7 @@ func init() {
 		WorkspacesInactiveShard,
 		WorkspacesMigrating,
 		ShardDrainBlocked,
+		ShardWithoutPods,
 		MigrationsStarted,
 		MigrationsCompleted,
 	)
