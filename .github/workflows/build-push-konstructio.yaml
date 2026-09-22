@@ -12,6 +12,7 @@ name: Build and Push (konstructio ghcr)
 #   git tag  vX.Y.Z        -> :vX.Y.Z and :latest       (release)
 #   push to  main-civo     -> :main-civo and :sha-<8>   (rolling)
 #   push to  hotfix-*      -> :branch-<8>
+#   push to  feat/**       -> :branch-<8>
 #   workflow_dispatch      -> the tag you type in
 #
 # One-time setup: the ghcr.io/konstructio/provider-terraform package must grant
@@ -30,6 +31,7 @@ on:
     branches:
       - 'main-civo'
       - 'hotfix-*'
+      - 'feat/**'
     tags:
       - 'v*'
 

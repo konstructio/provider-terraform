@@ -36,6 +36,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
 	"github.com/pkg/errors"
@@ -50,8 +51,6 @@ const (
 	errWriteVarFile     = "cannot write tfvars file"
 	errFmtInvalidConfig = "invalid Terraform configuration: found %d errors"
 	errRunCommand       = "shutdown while running terraform command"
-	errSigTerm          = "error sending SIGTERM to child process"
-	errWaitTerm         = "error waiting for child process to terminate"
 	errWriteLogs        = "error writing terraform logs to stdout"
 
 	tfDefault = "default"
@@ -233,7 +232,7 @@ var rwmutex = &sync.RWMutex{}
 // Init initializes a Terraform configuration.
 func (h Harness) Init(ctx context.Context, o ...InitOption) error {
 	args := append([]string{"init", "-input=false", "-no-color"}, InitArgsToString(o)...)
-	cmd := exec.CommandContext(ctx, h.Path, args...) //nolint:gosec
+	cmd := newCommand(ctx, h.Path, args...) //nolint:gosec
 	cmd.Dir = h.Dir
 	for _, e := range os.Environ() {
 		if strings.Contains(e, "TF_PLUGIN_CACHE_DIR") {
@@ -268,7 +267,7 @@ func (h Harness) Init(ctx context.Context, o ...InitOption) error {
 // but isn't is deemed invalid. Attempts to initialise an invalid configuration
 // will result in errors, which are not available in a machine readable format.
 func (h Harness) Validate(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, h.Path, "validate", "-json") //nolint:gosec
+	cmd := newCommand(ctx, h.Path, "validate", "-json") //nolint:gosec
 	cmd.Dir = h.Dir
 	if len(h.Envs) > 0 {
 		cmd.Env = append(os.Environ(), h.Envs...)
@@ -303,7 +302,7 @@ func (h Harness) Validate(ctx context.Context) error {
 // Workspace selects the named Terraform workspace. The workspace will be
 // created if it does not exist.
 func (h Harness) Workspace(ctx context.Context, name string) error {
-	cmd := exec.CommandContext(ctx, h.Path, "workspace", "select", "-no-color", name) //nolint:gosec
+	cmd := newCommand(ctx, h.Path, "workspace", "select", "-no-color", name) //nolint:gosec
 	cmd.Dir = h.Dir
 	if len(h.Envs) > 0 {
 		cmd.Env = append(os.Environ(), h.Envs...)
@@ -317,7 +316,7 @@ func (h Harness) Workspace(ctx context.Context, name string) error {
 	// We weren't able to select a workspace. We assume this was because the
 	// workspace doesn't exist, which causes Terraform to return non-zero. This
 	// is somewhat optimistic, but it shouldn't hurt to try.
-	cmd = exec.CommandContext(ctx, h.Path, "workspace", "new", "-no-color", name) //nolint:gosec
+	cmd = newCommand(ctx, h.Path, "workspace", "new", "-no-color", name) //nolint:gosec
 	cmd.Dir = h.Dir
 	if len(h.Envs) > 0 {
 		cmd.Env = append(os.Environ(), h.Envs...)
@@ -334,7 +333,7 @@ func (h Harness) Workspace(ctx context.Context, name string) error {
 
 // DeleteCurrentWorkspace deletes the current Terraform workspace if it is not the default.
 func (h Harness) DeleteCurrentWorkspace(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, h.Path, "workspace", "show", "-no-color") //nolint:gosec
+	cmd := newCommand(ctx, h.Path, "workspace", "show", "-no-color") //nolint:gosec
 	cmd.Dir = h.Dir
 	if len(h.Envs) > 0 {
 		cmd.Env = append(os.Environ(), h.Envs...)
@@ -354,7 +353,7 @@ func (h Harness) DeleteCurrentWorkspace(ctx context.Context) error {
 	if err != nil {
 		return Classify(err)
 	}
-	cmd = exec.CommandContext(ctx, h.Path, "workspace", "delete", "-no-color", name) //nolint:gosec
+	cmd = newCommand(ctx, h.Path, "workspace", "delete", "-no-color", name) //nolint:gosec
 	cmd.Dir = h.Dir
 	if len(h.Envs) > 0 {
 		cmd.Env = append(os.Environ(), h.Envs...)
@@ -377,7 +376,7 @@ func (h Harness) DeleteCurrentWorkspace(ctx context.Context) error {
 // GenerateChecksum calculates the md5sum of the workspace (excluding installed providers) to see if terraform init needs to run
 func (h Harness) GenerateChecksum(ctx context.Context) (string, error) {
 	command := "/usr/bin/find . -path ./.git -prune -o -path ./.terraform/providers -prune -o -type f -exec /usr/bin/md5sum {} + | LC_ALL=C /usr/bin/sort | /usr/bin/md5sum | /usr/bin/awk '{print $1}'"
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command) //nolint:gosec
+	cmd := newCommand(ctx, "/bin/sh", "-c", command) //nolint:gosec
 	cmd.Dir = h.Dir
 
 	checksum, err := runCommand(ctx, cmd)
@@ -464,7 +463,7 @@ func (o Output) JSONValue() ([]byte, error) {
 
 // Outputs extracts outputs from Terraform state.
 func (h Harness) Outputs(ctx context.Context) ([]Output, error) {
-	cmd := exec.CommandContext(ctx, h.Path, "output", "-json") //nolint:gosec
+	cmd := newCommand(ctx, h.Path, "output", "-json") //nolint:gosec
 	cmd.Dir = h.Dir
 	if len(h.Envs) > 0 {
 		cmd.Env = append(os.Environ(), h.Envs...)
@@ -524,7 +523,7 @@ func (h Harness) Outputs(ctx context.Context) ([]Output, error) {
 
 // Resources returns a list of resources in the Terraform state.
 func (h Harness) Resources(ctx context.Context) ([]string, error) {
-	cmd := exec.CommandContext(ctx, h.Path, "state", "list") //nolint:gosec
+	cmd := newCommand(ctx, h.Path, "state", "list") //nolint:gosec
 	cmd.Dir = h.Dir
 	if len(h.Envs) > 0 {
 		cmd.Env = append(os.Environ(), h.Envs...)
@@ -610,7 +609,7 @@ func (h Harness) Diff(ctx context.Context, o ...Option) (bool, error) {
 	}
 
 	args := append([]string{"plan", "-no-color", "-input=false", "-detailed-exitcode", "-lock=false"}, ao.args...)
-	cmd := exec.CommandContext(ctx, h.Path, args...) //nolint:gosec
+	cmd := newCommand(ctx, h.Path, args...) //nolint:gosec
 	cmd.Dir = h.Dir
 	if len(h.Envs) > 0 {
 		cmd.Env = append(os.Environ(), h.Envs...)
@@ -660,7 +659,7 @@ func (h Harness) Apply(ctx context.Context, ws string, o ...Option) error {
 	}
 
 	args := append([]string{"apply", "-no-color", "-auto-approve", "-input=false"}, ao.args...)
-	cmd := exec.CommandContext(ctx, h.Path, args...) //nolint:gosec
+	cmd := newCommand(ctx, h.Path, args...) //nolint:gosec
 	cmd.Dir = h.Dir
 	if len(h.Envs) > 0 {
 		cmd.Env = append(os.Environ(), h.Envs...)
@@ -712,7 +711,7 @@ func (h Harness) Destroy(ctx context.Context, ws string, o ...Option) error {
 	}
 
 	args := append([]string{"destroy", "-no-color", "-auto-approve", "-input=false"}, do.args...)
-	cmd := exec.CommandContext(ctx, h.Path, args...) //nolint:gosec
+	cmd := newCommand(ctx, h.Path, args...) //nolint:gosec
 	cmd.Dir = h.Dir
 	if len(h.Envs) > 0 {
 		cmd.Env = append(os.Environ(), h.Envs...)
@@ -750,34 +749,74 @@ func (h Harness) Destroy(ctx context.Context, ws string, o ...Option) error {
 	return Classify(err)
 }
 
+// GroupTermGrace is how long a cancelled command's process group has to exit
+// after SIGTERM before the runtime force-kills it.
+const GroupTermGrace = 30 * time.Second
+
+// newCommand returns a command whose children run in their own process group,
+// and whose cancellation signals that whole group.
+//
+// terraform spawns terraform-provider-* plugins, and /bin/sh spawns the
+// checksum pipeline. Signalling only the direct child leaves those
+// grandchildren orphaned: they reparent to PID 1 - which is this provider,
+// running without an init that reaps - and become zombies. cgroup v2 charges a
+// zombie against pids.current until it is reaped, so they accumulate
+// invisibly (they are not listed in cgroup.procs) until the container can no
+// longer fork.
+//
+// It also matters for sharding: a handover assumes that once a shard's pod is
+// gone no terraform of its is still running. Without a process group, killing
+// the provider leaves the apply running.
+func newCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, name, args...) //nolint:gosec // see the G204 note above
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	// Replace CommandContext's default cancel, which SIGKILLs the direct child
+	// only. WaitDelay then bounds how long we wait before the runtime gives up
+	// and force-kills it, so Wait cannot block forever on a child that ignores
+	// SIGTERM.
+	cmd.Cancel = func() error { return killGroup(cmd, syscall.SIGTERM) }
+	cmd.WaitDelay = GroupTermGrace
+
+	return cmd
+}
+
+// killGroup signals the command's whole process group. It is a no-op if the
+// process was never started.
+func killGroup(c *exec.Cmd, sig syscall.Signal) error {
+	if c.Process == nil {
+		return nil
+	}
+	// A negative PID addresses the process group led by that PID, which is
+	// what Setpgid made the child.
+	if err := syscall.Kill(-c.Process.Pid, sig); err != nil {
+		return err
+	}
+	return nil
+}
+
 // cmdResult represents the result of the command execution
 type cmdResult struct {
 	out []byte
 	err error
 }
 
-// runCommand executes the requested command and sends the process SIGTERM if the context finishes before the command
+// runCommand executes the requested command. If the context finishes first,
+// the command's whole process group is terminated.
 func runCommand(ctx context.Context, c *exec.Cmd) ([]byte, error) {
 	ch := make(chan cmdResult, 1)
 	go func() {
-		defer close(ch)
 		r, e := c.Output()
 		ch <- cmdResult{out: r, err: e}
 	}()
 	select {
 	case <-ctx.Done():
-		err := ctx.Err()
-		// This could be container termination or the reconciliation deadline was exceeded.  Either way send a
-		// SIGTERM to the running process and wait for either the command to finish or the process to get killed.
-		e := c.Process.Signal(syscall.SIGTERM)
-		if e != nil {
-			return nil, errors.Wrap(errors.Wrap(err, errRunCommand), errors.Wrap(e, errSigTerm).Error())
-		}
-		e = c.Wait()
-		if e != nil {
-			return nil, errors.Wrap(errors.Wrap(err, errRunCommand), errors.Wrap(e, errWaitTerm).Error())
-		}
-		return nil, errors.Wrap(err, errRunCommand)
+		// c.Cancel has already SIGTERMed the process group and c.WaitDelay
+		// bounds how long the runtime waits before force-killing it, so all
+		// that is left is to let c.Output()'s own Wait return. Calling
+		// c.Wait() here as well would race that one.
+		<-ch
+		return nil, errors.Wrap(ctx.Err(), errRunCommand)
 	case res := <-ch:
 		// c.Output() records the command's stderr on the *exec.ExitError, but
 		// terraform frequently prints the actual failure (e.g. a missing provider
@@ -804,36 +843,23 @@ func createLogFile(ws string) (*os.File, error) {
 	return os.Create(filepath.Join(logDir, name)) //nolint:gosec // path is constrained to logDir/<base>
 }
 
-// runCommandv2 executes the requested command, streaming stdout/stderr to f, and sends the process SIGTERM if the
-// context finishes before the command.
+// runCommandv2 executes the requested command, streaming stdout/stderr to f.
+// If the context finishes first, the command's whole process group is
+// terminated.
 func runCommandv2(ctx context.Context, c *exec.Cmd, f io.Writer) ([]byte, error) {
+	c.Stderr = f
+	c.Stdout = f
+
 	ch := make(chan cmdResult, 1)
 	go func() {
-		defer close(ch)
-		c.Stderr = f
-		c.Stdout = f
-		e := c.Run()
-		ch <- cmdResult{err: e}
+		ch <- cmdResult{err: c.Run()}
 	}()
 	select {
 	case <-ctx.Done():
-		err := ctx.Err()
-		// This could be container termination or the reconciliation deadline was exceeded.  Either way send a
-		// SIGTERM to the running process and wait for either the command to finish or the process to get killed.
-		e := c.Process.Signal(syscall.SIGTERM)
-		if e != nil {
-			return nil, errors.Wrap(errors.Wrap(err, errRunCommand), errors.Wrap(e, errSigTerm).Error())
-		}
-		e = c.Wait()
-		if e != nil {
-			return nil, errors.Wrap(errors.Wrap(err, errRunCommand), errors.Wrap(e, errWaitTerm).Error())
-		}
-		return nil, errors.Wrap(err, errRunCommand)
+		// See runCommand: the group has already been signalled by c.Cancel.
+		<-ch
+		return nil, errors.Wrap(ctx.Err(), errRunCommand)
 	case res := <-ch:
-		// c.Output() records the command's stderr on the *exec.ExitError, but
-		// terraform frequently prints the actual failure (e.g. a missing provider
-		// plugin) to stdout. When stderr is empty, fold stdout into the error so
-		// Classify surfaces something actionable instead of an empty summary.
 		var ee *exec.ExitError
 		if errors.As(res.err, &ee) && len(ee.Stderr) == 0 && len(res.out) > 0 {
 			ee.Stderr = res.out

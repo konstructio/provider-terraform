@@ -1,0 +1,24 @@
+# Builds the shard assigner, which writes terraform.crossplane.io/shard onto
+# every Workspace. It is a separate image from the provider controller because
+# it is a separate concern with a different cache shape: the provider's cache is
+# shard filtered, the assigner's must not be.
+FROM golang:1.26-alpine AS build
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY apis/ apis/
+COPY internal/ internal/
+COPY cmd/ cmd/
+COPY pkg/ pkg/
+
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -o /out/shard-assigner ./cmd/shard-assigner
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/shard-assigner /shard-assigner
+USER 65532:65532
+ENTRYPOINT ["/shard-assigner"]

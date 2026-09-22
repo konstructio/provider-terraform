@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provider-terraform-shard-assigner
+  namespace: crossplane-system
+  labels:
+    app: provider-terraform-shard-assigner
+spec:
+  # Two replicas are safe - leader election keeps exactly one writing - but one
+  # is enough: a wedged assigner is caught by the unlabelled-Workspace alert,
+  # and nothing stops reconciling while it is down.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: provider-terraform-shard-assigner
+  template:
+    metadata:
+      labels:
+        app: provider-terraform-shard-assigner
+    spec:
+      serviceAccountName: provider-terraform-shard-assigner
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: shard-assigner
+          image: ghcr.io/konstructio/provider-terraform-shard-assigner:latest
+          args:
+            - --namespace=crossplane-system
+            - --migration-batch=5
+            - --stale-migration=30m
+          ports:
+            - name: metrics
+              containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: provider-terraform-shard-assigner
+  namespace: crossplane-system
+  labels:
+    app: provider-terraform-shard-assigner
+spec:
+  selector:
+    app: provider-terraform-shard-assigner
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: metrics

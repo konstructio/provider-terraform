@@ -1,0 +1,30 @@
+# The only knob. Rendering N Deployments from one value is what keeps a
+# 100-shard fleet from being 100 hand-written manifests, and it is why there is
+# no ConfigMap: the Deployments themselves are the desired state the assigner
+# reads.
+shardCount: 4
+
+# Must match the image Crossplane's own (replicas: 0) provider Deployment runs.
+image: ghcr.io/konstructio/provider-terraform:main-civo
+
+# Crossplane creates this for the package; the shards reuse it so they get
+# exactly the RBAC and IRSA annotations the provider already has.
+serviceAccountName: crossplane-provider-terraform-mgmt-gitops-ing
+
+namespace: crossplane-system
+
+# Above the p99 terraform apply duration. A terraform killed mid-apply leaves a
+# stale backend lock needing a manual force-unlock, and a shard that is torn
+# down mid-apply is exactly the case a drain has to survive.
+terminationGracePeriodSeconds: 900
+gracefulShutdownTimeout: 10m
+
+pollInterval: 4m
+maxReconcileRate: 10
+
+# Per-shard drain overrides: listed shards render with replicas: 0, which the
+# assigner reads as "migrate its Workspaces away". Use this to drain a shard in
+# the middle of the range; a count alone can only remove from the top.
+draining: []
+# draining:
+#   - shard-2

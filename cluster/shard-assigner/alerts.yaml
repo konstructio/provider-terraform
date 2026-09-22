@@ -1,0 +1,97 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: provider-terraform-sharding
+  namespace: crossplane-system
+spec:
+  groups:
+    - name: provider-terraform-sharding
+      rules:
+        # The important one. An unlabelled Workspace is reconciled by no shard
+        # at all, and nothing else surfaces that - it just silently stops.
+        - alert: TerraformWorkspaceUnsharded
+          expr: terraform_shard_workspaces_unlabelled > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: Workspaces have no shard label and are not being reconciled
+            description: >-
+              {{ $value }} Workspace(s) carry no terraform.crossplane.io/shard
+              label. No controller instance watches them. The shard assigner is
+              probably wedged or not running.
+
+        - alert: TerraformWorkspaceOnInactiveShard
+          expr: terraform_shard_workspaces_inactive_shard > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Workspaces are labelled to a draining or out-of-range shard
+            description: >-
+              {{ $value }} Workspace(s) still point at a shard that is draining
+              or above shardCount. Migrations are serialised, so a slow drain is
+              expected; ten minutes without progress is not.
+
+        # The drain is waiting on you: scale the draining shard's Deployment
+        # to zero. Until its pod is gone the assigner will not move its
+        # Workspaces, because both processes would write the same state.
+        - alert: TerraformShardDrainBlocked
+          expr: terraform_shard_drain_blocked > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: A draining shard still has a running pod
+            description: >-
+              Shard {{ $labels.shard }} is being drained or removed but still
+              has a running pod, so the assigner will not migrate its
+              Workspaces - two terraform processes would write the same state.
+              Normally this clears itself once the pod finishes terminating; if
+              it does not, that pod is stuck.
+
+        # Desired state says alive, reality says dead. Nothing else catches
+        # this: the Workspaces do have a label, and it does point at an active
+        # shard, so they look correctly placed while being reconciled by
+        # nobody.
+        - alert: TerraformShardWithoutPods
+          expr: terraform_shard_without_pods > 0
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: An active shard has no running pod
+            description: >-
+              Shard {{ $labels.shard }} has a Deployment asking for replicas but
+              no running pod - crash-looping, unschedulable, or stuck. Its
+              Workspaces are not being reconciled by anything. The assigner will
+              not move them automatically, because that would make every rolling
+              restart look like a dead shard. Fix the pod, or set that shard's
+              replicas to 0 to have its Workspaces migrated away.
+
+        - alert: TerraformShardMigrationStalled
+          expr: terraform_shard_workspaces_migrating > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: A Workspace migration has not completed
+            description: >-
+              A Workspace has carried terraform.crossplane.io/migrating-at for
+              over 30 minutes without reaching Synced=True on its new shard.
+              Past this cutoff the assigner stops letting it hold a batch slot
+              and moves on, so check why that Workspace is not syncing.
+
+        - alert: TerraformShardImbalance
+          expr: >-
+            (max(terraform_shard_workspaces) - min(terraform_shard_workspaces))
+              > (0.5 * avg(terraform_shard_workspaces))
+          for: 30m
+          labels:
+            severity: info
+          annotations:
+            summary: Workspaces are unevenly distributed across shards
+            description: >-
+              Placement is least-loaded at assignment time and never rebalances
+              on its own, so drift accumulates as Workspaces are deleted. This
+              is informational - rebalancing is a deliberate action.
