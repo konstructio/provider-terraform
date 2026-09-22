@@ -19,6 +19,13 @@ spec:
   deploymentTemplate:
     spec:
       template:
+        metadata:
+          labels:
+            # REQUIRED. The assigner reads this to tell whether the shard's
+            # process is still running before migrating its Workspaces away.
+            # Without it the assigner cannot verify liveness and refuses to
+            # migrate at all.
+            terraform.crossplane.io/shard: shard-0
         spec:
           # Above the p99 terraform apply duration. A terraform killed
           # mid-apply leaves a stale backend lock needing a manual

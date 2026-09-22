@@ -27,6 +27,14 @@ and is still open; this fork does not depend on it.
 | `--shard-name` | `SHARD_NAME` | *(empty)* | Reconcile only Workspaces labelled `terraform.crossplane.io/shard=<name>`. Empty reconciles everything, i.e. the stock unsharded behaviour. |
 | `--graceful-shutdown-timeout` | | `10m` | How long in-flight reconciles may finish after SIGTERM. |
 
+### Assigner flags
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--require-shard-offline` | `true` | Refuse to migrate a Workspace while its current shard still has a running pod. |
+| `--pod-namespace` | `crossplane-system` | Where the sharded provider Deployments run. |
+| `--stale-migration` | `30m` | How long a Workspace that never syncs may block further migrations. |
+
 Setting `--shard-name` changes four things:
 
 1. The Workspace informers are filtered with an equality label selector, so
@@ -75,17 +83,33 @@ Three properties worth knowing:
 - **Labels are sticky.** A Workspace is relabelled only when it is unplaced, or
   when its shard is draining or has fallen out of range. Normal operation never
   relabels.
-- **The label does not guarantee a single writer, and is not meant to.** When a
-  Workspace moves from shard-3 to shard-0, shard-3 may be mid-apply; informer
-  eviction is not ordered against shard-0 picking it up. The same overlap exists
-  on any rolling restart, sharded or not. What protects Terraform state is the
-  **backend lock**. The assigner's job is to keep the window narrow — one
-  Workspace at a time — not to eliminate it.
+- **A Workspace is never moved off a shard whose pod is still running.** This
+  is the important one, and it is why the drain procedure below looks the way
+  it does.
 
-  **Confirm backend locking before enabling sharding at all.** S3 needs a
-  DynamoDB lock table or `use_lockfile = true` (Terraform ≥ 1.10). GCS and
-  azurerm lock natively. An HTTP backend must implement `LOCK`/`UNLOCK`. Local
+  Shards are separate pods, so separate processes. A shard appearing in
+  `draining` says nothing about whether its process is still running — it may
+  be mid-`terraform apply` right now. Relabel a Workspace off it and two
+  independent `terraform` processes are writing the same remote state. If that
+  backend does not lock, nothing stops them: it is not a lock-contention error
+  you can retry, it is a silent clobber.
+
+  So before any migration the assigner lists pods carrying
+  `terraform.crossplane.io/shard` and refuses to move a Workspace while its
+  current shard still has one running. It **fails closed**: any error, or no
+  shard-labelled pods at all, and nothing migrates. That last case is what a
+  missing pod-template label looks like, and reading it as "everything is
+  offline" would disable the check exactly when it matters.
+
+  `--require-shard-offline=false` opts out, and is only reasonable with backend
+  locking confirmed: S3 with a DynamoDB lock table or `use_lockfile = true`
+  (Terraform ≥ 1.10), GCS, or azurerm — all of which lock natively. Local
   state, or S3 with neither mechanism, is genuinely corruptible under handover.
+
+  The residual overlap the lock still has to cover is informer eviction: when
+  the label changes, the old shard's cache is not evicted in an order
+  guaranteed against the new shard picking it up. With the old shard's pod
+  already gone, there is no process left to act on that stale cache entry.
 
 ## Configuration
 
@@ -127,20 +151,33 @@ automatic rebalance, by design.
 
 ### Scale down (remove shard-3)
 
-1. Add `shard-3` to `draining`. The assigner stops placing new Workspaces there.
-2. It relabels shard-3's Workspaces **one at a time**, waiting for each to reach
-   `SYNCED=True` on its new shard before starting the next. Watch progress with
-   `terraform_shard_workspaces_inactive_shard`.
-3. Once shard-3 owns nothing, scale its Deployment to zero and drop
-   `shardCount` to 3.
+1. Add `shard-3` to `draining`. The assigner stops placing new Workspaces
+   there, but does **not** move the ones it has yet.
+2. **Scale shard-3's Deployment to zero and wait for its pod to go away.**
+   Until then the assigner refuses to migrate anything off it, and
+   `terraform_shard_drain_blocked{shard="shard-3"}` is 1. Give it at least
+   `terminationGracePeriodSeconds` so any in-flight apply finishes cleanly
+   rather than being killed into a stale backend lock.
+3. With the pod gone, the assigner relabels shard-3's Workspaces **one at a
+   time**, waiting for each to reach `SYNCED=True` on its new shard before
+   starting the next. Watch `terraform_shard_workspaces_inactive_shard` fall.
+4. Once shard-3 owns nothing, drop `shardCount` to 3 and delete the Deployment.
+
+Note step 2 is the opposite of what you would do if the label alone were the
+safety mechanism. It is deliberate: shard-3's Workspaces sit unreconciled
+between steps 2 and 3, and that is strictly better than two `terraform`
+processes writing one state file. The `terraform_shard_drain_blocked` alert
+exists so a half-finished drain is visible rather than silent.
 
 Two ways to get this wrong:
 
-- **Do not delete the pod first.** Its Workspaces sit unreconciled until the
-  assigner moves them, and nothing alerts on a shard that merely has no pod.
 - **Do not drop `shardCount` before draining.** Every Workspace on the removed
-  shard becomes out-of-range at once and the relabels all fire together, which
-  is exactly the wide overlap the one-at-a-time gate exists to avoid.
+  shard becomes out-of-range at once. They still will not move while its pod
+  runs, but you lose the explicit `draining` marker that says a drain is in
+  progress.
+- **Do not forget the pod-template label.** Every shard Deployment's pod
+  template needs `terraform.crossplane.io/shard: shard-N`. Without it the
+  assigner cannot verify liveness and, failing closed, migrates nothing.
 
 A migration that never reaches `SYNCED=True` stops blocking the drain after
 `--stale-migration` (default 30m); the assigner logs loudly and moves on, so one
@@ -168,6 +205,7 @@ permanently broken Workspace cannot wedge a drain forever.
 | `terraform_shard_workspaces_unlabelled` | gauge | Workspaces no shard reconciles |
 | `terraform_shard_workspaces_inactive_shard` | gauge | Workspaces awaiting migration |
 | `terraform_shard_workspaces_migrating` | gauge | Migrations in flight |
+| `terraform_shard_drain_blocked{shard}` | gauge | 1 while a draining shard still has a running pod |
 | `terraform_shard_migrations_started_total{from,to}` | counter | Relabels performed |
 | `terraform_shard_migrations_completed_total{shard}` | counter | Migrations that synced |
 

@@ -60,6 +60,9 @@ func main() {
 		censusInterval = app.Flag("census-interval", "How often the placement gauges are refreshed.").Default("30s").Duration()
 
 		metricsBind = app.Flag("metrics-bind-address", "Address the metrics endpoint binds to.").Default(":8080").String()
+
+		podNamespace        = app.Flag("pod-namespace", "Namespace the sharded provider Deployments run in.").Default("crossplane-system").String()
+		requireShardOffline = app.Flag("require-shard-offline", "Refuse to migrate a Workspace while its current shard still has a running pod. Shards are separate processes, so a shard listed in draining may still be mid-apply; moving a Workspace off it lets two terraform processes write the same remote state. Only set this false if the Terraform backend is confirmed to lock state (S3 with a DynamoDB table or use_lockfile, GCS, azurerm).").Default("true").Bool()
 	)
 	kingpin.MustParse(app.Parse(os.Args[1:]))
 
@@ -101,15 +104,18 @@ func main() {
 	kingpin.FatalIfError(err, "Cannot create controller manager")
 
 	kingpin.FatalIfError(shard.Setup(mgr, log, shard.SetupOptions{
-		ConfigRef:      types.NamespacedName{Namespace: *configNamespace, Name: *configName},
-		StaleMigration: *staleMigration,
-		CensusInterval: *censusInterval,
+		ConfigRef:           types.NamespacedName{Namespace: *configNamespace, Name: *configName},
+		StaleMigration:      *staleMigration,
+		CensusInterval:      *censusInterval,
+		PodNamespace:        *podNamespace,
+		RequireShardOffline: *requireShardOffline,
 	}), "Cannot setup shard assigner")
 
 	log.Info("Starting shard assigner",
 		"config", *configNamespace+"/"+*configName,
 		"sync-interval", syncInterval.String(),
-		"stale-migration", staleMigration.String())
+		"stale-migration", staleMigration.String(),
+		"require-shard-offline", *requireShardOffline)
 
 	kingpin.FatalIfError(mgr.Start(ctrl.SetupSignalHandler()), "Cannot start controller manager")
 }

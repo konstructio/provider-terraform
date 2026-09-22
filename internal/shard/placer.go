@@ -34,6 +34,11 @@ const (
 	errParseConfig    = "cannot parse shard config"
 	errListWorkspaces = "cannot list workspaces"
 	errNoActiveShards = "no active shards: every shard is draining or shardCount is unset"
+	errListShardPods  = "cannot list shard pods"
+
+	errFmtNoShardPods = "cannot verify which shards are running: no pod in namespace %q carries the %s label. " +
+		"Label every shard Deployment's pod template with it, or set --require-shard-offline=false if the " +
+		"Terraform backend is confirmed to lock state"
 )
 
 // DefaultStaleMigration is how long a migrating-at annotation may sit on a
@@ -51,6 +56,20 @@ type Placer struct {
 	kinds  []Kind
 	cfgRef types.NamespacedName
 	log    logging.Logger
+
+	// pods answers "is this shard's process still running". It must be a
+	// live, uncached reader: a stale cache here decides whether two terraform
+	// processes are allowed to touch the same state file. It also avoids
+	// caching every Pod in the cluster.
+	pods client.Reader
+
+	// podNamespace is where the sharded provider Deployments run.
+	podNamespace string
+
+	// requireOffline refuses to migrate a Workspace while its current shard
+	// still has a running pod. Shards are separate processes, so a shard being
+	// listed in draining says nothing about whether it is still mid-apply.
+	requireOffline bool
 
 	// staleAfter bounds how long a stalled migration blocks the drain.
 	staleAfter time.Duration
@@ -96,19 +115,39 @@ func WithClock(f func() time.Time) PlacerOption {
 	return func(p *Placer) { p.now = f }
 }
 
+// WithPodReader sets the live reader and namespace used to check whether a
+// shard still has a running pod.
+func WithPodReader(r client.Reader, namespace string) PlacerOption {
+	return func(p *Placer) { p.pods, p.podNamespace = r, namespace }
+}
+
+// WithRequireShardOffline sets whether a Workspace may be migrated while its
+// current shard still has a running pod.
+//
+// Keep this on unless the Terraform backend is confirmed to lock state. Shards
+// are separate processes: relabelling a Workspace off a live shard lets two
+// terraform processes write the same remote state, and an unlocked backend -
+// S3 with neither a DynamoDB table nor use_lockfile, or local state - will not
+// stop them.
+func WithRequireShardOffline(v bool) PlacerOption {
+	return func(p *Placer) { p.requireOffline = v }
+}
+
 // NewPlacer returns a Placer reading desired state from the named ConfigMap.
 // kube must be an uncached reader, or a reader whose cache is not shard
 // filtered: a Placer that cannot see other shards' Workspaces will pile every
 // new Workspace onto one shard.
 func NewPlacer(kube client.Reader, cfgRef types.NamespacedName, log logging.Logger, o ...PlacerOption) *Placer {
 	p := &Placer{
-		kube:       kube,
-		kinds:      Kinds(),
-		cfgRef:     cfgRef,
-		log:        log,
-		staleAfter: DefaultStaleMigration,
-		cost:       func(Workspace) float64 { return 1 },
-		now:        time.Now,
+		kube:           kube,
+		kinds:          Kinds(),
+		cfgRef:         cfgRef,
+		log:            log,
+		staleAfter:     DefaultStaleMigration,
+		cost:           func(Workspace) float64 { return 1 },
+		now:            time.Now,
+		requireOffline: true,
+		podNamespace:   "crossplane-system",
 	}
 	for _, fn := range o {
 		fn(p)
@@ -238,4 +277,51 @@ func (p *Placer) Census(ctx context.Context, cfg Config) (Census, error) {
 		}
 	})
 	return c, err
+}
+
+// OnlineShards returns the set of shards that still have a running pod.
+//
+// It fails closed: any error and the caller must not migrate anything.
+//
+// Finding no shard-labelled pods at all is treated as an error rather than as
+// "everything is offline". That is what a missing pod-template label looks
+// like, and silently reading it as "safe to migrate" would defeat the check
+// exactly when it matters.
+func (p *Placer) OnlineShards(ctx context.Context) (map[string]bool, error) {
+	pods := &corev1.PodList{}
+	if err := p.pods.List(ctx, pods,
+		client.InNamespace(p.podNamespace),
+		client.HasLabels{ShardLabel},
+	); err != nil {
+		return nil, errors.Wrap(err, errListShardPods)
+	}
+	if len(pods.Items) == 0 {
+		return nil, errors.Errorf(errFmtNoShardPods, p.podNamespace, ShardLabel)
+	}
+
+	online := map[string]bool{}
+	for _, pod := range pods.Items {
+		// Succeeded and Failed mean every container has terminated, so no
+		// terraform is running. Anything else - including a pod still
+		// terminating inside its grace period - counts as online, because
+		// that is exactly when an apply may still be in flight.
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		online[pod.Labels[ShardLabel]] = true
+	}
+	return online, nil
+}
+
+// ShardOnline reports whether shard still has a pod running. It is the gate on
+// every migration: shards are separate processes, and relabelling a Workspace
+// off a shard whose pod is alive lets two terraform processes write the same
+// remote state. With an unlocked backend that is silent corruption, not a lock
+// contention error.
+func (p *Placer) ShardOnline(ctx context.Context, shard string) (bool, error) {
+	online, err := p.OnlineShards(ctx)
+	if err != nil {
+		return false, err
+	}
+	return online[shard], nil
 }

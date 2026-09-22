@@ -38,6 +38,12 @@ const (
 // waiting its turn simply asks again.
 const RequeueMigration = 15 * time.Second
 
+// RequeueShardOnline is how long to wait before re-checking whether a shard
+// that is being drained has actually stopped. Longer than RequeueMigration:
+// this one waits on an operator scaling a Deployment down, not on a reconcile
+// finishing.
+const RequeueShardOnline = 30 * time.Second
+
 // An Assigner reconciles one Workspace kind, writing the shard label that
 // decides which controller instance owns each Workspace.
 //
@@ -84,12 +90,34 @@ func (a *Assigner) Reconcile(ctx context.Context, req reconcile.Request) (reconc
 	}
 
 	// Needs placement: unlabelled, or its owner is draining or out of range.
-	// Serialising migrations keeps the handover overlap one Workspace wide
-	// rather than a whole shard wide. The lock covers the whole decision, so
-	// the two kind controllers cannot both pass the gate at once.
+	// The lock covers the whole decision, so the two kind controllers cannot
+	// both pass the gates at once.
 	defer a.placer.Lock()()
 
 	if cur != "" {
+		// Shards are separate pods, so a shard appearing in `draining` says
+		// nothing about whether its process is still running. Relabelling a
+		// Workspace off a live shard lets two terraform processes write the
+		// same remote state - and an unlocked backend will not stop them.
+		// Wait for the shard's pod to go away first.
+		if a.placer.requireOffline {
+			online, err := a.placer.ShardOnline(ctx, cur)
+			if err != nil {
+				// Fail closed: if we cannot tell, we do not migrate.
+				return reconcile.Result{}, err
+			}
+			if online {
+				ShardDrainBlocked.WithLabelValues(cur).Set(1)
+				a.log.Debug("Not migrating: the current shard still has a running pod",
+					"workspace", ws.GetName(), "shard", cur)
+				return reconcile.Result{RequeueAfter: RequeueShardOnline}, nil
+			}
+			ShardDrainBlocked.WithLabelValues(cur).Set(0)
+		}
+
+		// Serialising migrations keeps the handover one Workspace wide, so a
+		// receiving shard is not hit by a whole shard's worth of terraform
+		// init at once.
 		n, err := a.placer.MigrationsInFlight(ctx)
 		if err != nil {
 			return reconcile.Result{}, err
