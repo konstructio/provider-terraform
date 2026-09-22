@@ -134,6 +134,13 @@ func WithNamespace(ns string) PlacerOption {
 	return func(p *Placer) { p.namespace = ns }
 }
 
+// WithKinds sets the Workspace kinds to place. The default is every kind this
+// package knows about, which is only correct on a cluster that serves them
+// all - see installedKinds.
+func WithKinds(k []Kind) PlacerOption {
+	return func(p *Placer) { p.kinds = k }
+}
+
 // WithRequireShardOffline sets whether a Workspace may be migrated while its
 // current shard still has a running pod.
 //
