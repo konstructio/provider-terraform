@@ -1,0 +1,88 @@
+# Sharded provider-terraform instances.
+#
+# IMPORTANT: a Crossplane `Provider` resource manages exactly one Deployment,
+# and `replicas: N` on it gives active/passive HA (one leader), not sharding.
+# So shard-0 runs as the Crossplane-managed instance via a
+# DeploymentRuntimeConfig, and the remaining shards run as ordinary Deployments
+# alongside it, reusing the package's ServiceAccount and RBAC.
+#
+# Every shard must run the same image as the Crossplane-managed one. Check it
+# with:
+#   kubectl -n crossplane-system get deploy -l pkg.crossplane.io/provider=provider-terraform \
+#     -o jsonpath='{.items[0].spec.template.spec.containers[0].image}'
+---
+apiVersion: pkg.crossplane.io/v1beta1
+kind: DeploymentRuntimeConfig
+metadata:
+  name: provider-terraform-shard-0
+spec:
+  deploymentTemplate:
+    spec:
+      template:
+        spec:
+          # Above the p99 terraform apply duration. A terraform killed
+          # mid-apply leaves a stale backend lock needing a manual
+          # force-unlock, which is how state actually gets damaged in
+          # practice - far more often than by concurrent writers.
+          terminationGracePeriodSeconds: 900
+          containers:
+            - name: package-runtime
+              args:
+                - --debug
+                - --poll=4m
+                - --max-reconcile-rate=10
+                - --shard-name=shard-0
+                - --graceful-shutdown-timeout=10m
+                - --leader-election
+---
+# One of these per additional shard: shard-1, shard-2, shard-3 ...
+# The shard name must match a shard the assigner considers active, i.e. be
+# below shardCount in the provider-terraform-shards ConfigMap.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provider-terraform-shard-1
+  namespace: crossplane-system
+  labels:
+    app: provider-terraform
+    terraform.crossplane.io/shard: shard-1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: provider-terraform
+      terraform.crossplane.io/shard: shard-1
+  template:
+    metadata:
+      labels:
+        app: provider-terraform
+        terraform.crossplane.io/shard: shard-1
+    spec:
+      # Reuse the ServiceAccount Crossplane created for the package, so this
+      # shard has exactly the RBAC the provider already has.
+      serviceAccountName: provider-terraform
+      terminationGracePeriodSeconds: 900
+      containers:
+        - name: package-runtime
+          # Must match the Crossplane-managed instance's image.
+          image: ghcr.io/konstructio/provider-terraform:main-civo
+          args:
+            - --debug
+            - --poll=4m
+            - --max-reconcile-rate=10
+            - --shard-name=shard-1
+            - --graceful-shutdown-timeout=10m
+            - --leader-election
+          ports:
+            - name: metrics
+              containerPort: 8080
+          volumeMounts:
+            - name: tf
+              mountPath: /tf
+            - name: logs
+              mountPath: /logs
+      volumes:
+        - name: tf
+          emptyDir: {}
+        - name: logs
+          emptyDir: {}

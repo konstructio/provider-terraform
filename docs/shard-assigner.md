@@ -5,17 +5,53 @@
 controller — the stock active/passive HA model — is therefore a throughput
 bottleneck once you have hundreds of Workspaces.
 
-Upstream [PR #288][288] lets several controller instances run at once, each
-watching only the Workspaces labelled with its own shard name. **It only
-consumes the label; nothing assigns it**, and a Workspace with no label is
-reconciled by no shard at all. This assigner fills that gap: it owns placement.
+Sharding lets several controller instances run at once, each watching only the
+Workspaces labelled with its own shard name. Two halves:
+
+- **The provider consumes the label.** `--shard-name=shard-N` filters its
+  Workspace informers, gives it its own leader-election lease, and makes its
+  garbage collector reclaim the working directories of Workspaces that belong
+  elsewhere.
+- **The shard assigner writes the label.** A Workspace with no label is
+  reconciled by no shard at all, so something has to own placement.
+
+Both are implemented here. Upstream [PR #288][288] proposes the consuming half
+and is still open; this fork does not depend on it.
 
 [288]: https://github.com/crossplane-contrib/provider-terraform/pull/288
 
-> **Status.** PR #288 is still open upstream and is not in this fork. The
-> assigner is useful and safe to run without it (see Phase 1 below), but the
-> labels it writes are inert until #288 lands and the provider is configured
-> with `--shard-name`.
+## Provider flags
+
+| Flag | Env | Default | Meaning |
+| --- | --- | --- | --- |
+| `--shard-name` | `SHARD_NAME` | *(empty)* | Reconcile only Workspaces labelled `terraform.crossplane.io/shard=<name>`. Empty reconciles everything, i.e. the stock unsharded behaviour. |
+| `--graceful-shutdown-timeout` | | `10m` | How long in-flight reconciles may finish after SIGTERM. |
+
+Setting `--shard-name` changes four things:
+
+1. The Workspace informers are filtered with an equality label selector, so
+   cache memory and watch traffic scale with this shard's share rather than the
+   whole fleet.
+2. The leader-election lease ID gets the shard name appended, so shards are
+   active concurrently instead of electing one leader across all of them.
+3. The working-directory garbage collector reclaims directories belonging to
+   other shards, not just to deleted Workspaces. **Without this every migration
+   leaks a directory.**
+4. Every provider metric gains a constant `shard` label.
+
+The garbage collector reads through `mgr.GetAPIReader()`, never the manager's
+cache. A sharded cache holds only this shard's Workspaces, so a cached list
+would make the collector treat every *other* shard's directories as orphaned
+and delete them. `GarbageCollector.kube` is a `client.Reader` to keep that
+mistake from compiling.
+
+## Graceful shutdown
+
+Set `terminationGracePeriodSeconds` above the p99 apply duration on every shard
+Deployment, and keep `--graceful-shutdown-timeout` below it. A `terraform`
+killed mid-apply leaves a stale backend lock that needs a manual
+`force-unlock` — in practice that damages state far more often than concurrent
+writers do.
 
 ## How placement is decided
 
@@ -68,7 +104,15 @@ Active shards are `shard-0 .. shard-{shardCount-1}` minus anything in
 `draining`. Those names must match the `--shard-name` values on the provider
 Deployments. A change to this ConfigMap re-evaluates every Workspace.
 
-Manifests live in [`examples/shard-assigner/`](../examples/shard-assigner/).
+Manifests live in [`examples/shard-assigner/`](../examples/shard-assigner/):
+the assigner itself, and
+[`provider-shards.yaml`](../examples/shard-assigner/provider-shards.yaml) for
+the sharded provider instances.
+
+> A Crossplane `Provider` resource manages exactly one Deployment, and
+> `replicas: N` on it is active/passive HA, not sharding. So shard-0 runs as
+> the Crossplane-managed instance via a `DeploymentRuntimeConfig` and the rest
+> run as ordinary Deployments beside it, reusing the package's ServiceAccount.
 
 ## Operational procedures
 
@@ -111,8 +155,8 @@ permanently broken Workspace cannot wedge a drain forever.
   find out whether something else owns `metadata.labels` on your Workspaces — if
   they are composed from XRs, a Composition reconcile may revert the label, in
   which case placement has to move into the Composition instead.
-- **Phase 2.** Confirm backend locking. Bring up shard-0..3 with `--shard-name`.
-  Scale the unsharded controller to zero.
+- **Phase 2.** Confirm backend locking. Bring up shard-0..3 with `--shard-name`
+  (see `provider-shards.yaml`). Scale the unsharded controller to zero.
 - **Phase 3.** Exercise a full drain of one shard in a non-production cluster
   before trusting it.
 
@@ -127,12 +171,19 @@ permanently broken Workspace cannot wedge a drain forever.
 | `terraform_shard_migrations_started_total{from,to}` | counter | Relabels performed |
 | `terraform_shard_migrations_completed_total{shard}` | counter | Migrations that synced |
 
+Every provider-side metric — `terraform_provider_*`, plus Crossplane's managed
+resource and state metrics — carries a constant `shard` label on a sharded
+instance, so reconcile duration and Workspace counts break out per shard
+without any dashboard changes beyond a `by (shard)`.
+
 Alerts are in [`examples/shard-assigner/alerts.yaml`](../examples/shard-assigner/alerts.yaml).
 The one that matters most is `TerraformWorkspaceUnsharded`: an unlabelled
 Workspace is reconciled by nobody and fails silently otherwise.
 
 ## Not built
 
+- **Automatic Deployment management for shards.** Adding a shard means adding a
+  Deployment and bumping `shardCount`; nothing reconciles the two together.
 - **Cost-weighted placement.** Placement counts objects. `Placer.cost` is the
   seam for weighting by observed reconcile duration — the reason this is an
   assigner rather than a hash — but it returns 1 for everything today.
