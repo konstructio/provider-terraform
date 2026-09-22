@@ -143,7 +143,7 @@ The shard label appears in three places, doing three different jobs:
 Miss the second and the assigner sees no fleet. Miss the third and it cannot
 verify liveness and, failing closed, migrates nothing.
 
-[`examples/shard-assigner/chart/`](../examples/shard-assigner/chart/) renders
+[`cluster/shard-assigner/chart/`](../cluster/shard-assigner/chart/) renders
 all of it from one value:
 
 ```yaml
@@ -236,7 +236,7 @@ resource and state metrics — carries a constant `shard` label on a sharded
 instance, so reconcile duration and Workspace counts break out per shard
 without any dashboard changes beyond a `by (shard)`.
 
-Alerts are in [`examples/shard-assigner/alerts.yaml`](../examples/shard-assigner/alerts.yaml).
+Alerts are in [`cluster/shard-assigner/alerts.yaml`](../cluster/shard-assigner/alerts.yaml).
 The one that matters most is `TerraformWorkspaceUnsharded`: an unlabelled
 Workspace is reconciled by nobody and fails silently otherwise.
 
