@@ -37,13 +37,16 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
+
+	"github.com/upbound/provider-terraform/internal/workdir"
 )
 
 const (
-	// ShardLabel names the controller shard that owns a Workspace. Upstream
-	// PR #288 consumes this label from the provider side as
-	// workdir.ShardLabel; the two strings must stay identical.
-	ShardLabel = "terraform.crossplane.io/shard"
+	// ShardLabel names the controller shard that owns a Workspace. It is an
+	// alias rather than a copy: the provider reads the same constant to filter
+	// its informers, and a drift between writer and reader would silently
+	// leave every Workspace unreconciled.
+	ShardLabel = workdir.ShardLabel
 
 	// MigratingAtAnnotation records when a Workspace was relabelled onto a
 	// new shard, RFC3339. It is present only between the relabel and the

@@ -2,7 +2,6 @@ package metrics
 
 import (
 	"github.com/prometheus/client_golang/prometheus"
-	"sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 // labelWorkspace is the metric label carrying the Workspace name.
@@ -64,8 +63,13 @@ var (
 	)
 )
 
-func init() {
-	metrics.Registry.MustRegister(
+// Register registers the provider's metrics with reg.
+//
+// Callers pass a registerer that may be wrapped with constant labels - the
+// shard name, for instance - so every series is broken out without changing
+// any metric definition here.
+func Register(reg prometheus.Registerer) {
+	reg.MustRegister(
 		GitHubAPIRequestsTotal,
 		GitHubAPIRequestDuration,
 		ModuleFetchTotal,

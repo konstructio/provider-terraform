@@ -34,11 +34,13 @@ import (
 	"github.com/crossplane/crossplane-runtime/v2/pkg/reconciler/customresourcesgate"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/statemetrics"
+	"github.com/prometheus/client_golang/prometheus"
 	zapuber "go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -58,13 +60,17 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 
 	apiscluster "github.com/upbound/provider-terraform/apis/cluster"
+	clusterv1beta1 "github.com/upbound/provider-terraform/apis/cluster/v1beta1"
 	apisnamespaced "github.com/upbound/provider-terraform/apis/namespaced"
+	namespacedv1beta1 "github.com/upbound/provider-terraform/apis/namespaced/v1beta1"
 	"github.com/upbound/provider-terraform/internal/bootcheck"
 	clusterworkspace "github.com/upbound/provider-terraform/internal/controller/cluster"
 	"github.com/upbound/provider-terraform/internal/controller/cluster/workspace"
 	"github.com/upbound/provider-terraform/internal/controller/gc"
 	namespacedworkspace "github.com/upbound/provider-terraform/internal/controller/namespaced"
 	"github.com/upbound/provider-terraform/internal/features"
+	"github.com/upbound/provider-terraform/internal/workdir"
+	tfmetrics "github.com/upbound/provider-terraform/pkg/metrics"
 )
 
 func init() {
@@ -91,6 +97,9 @@ func main() {
 		changelogsSocketPath     = app.Flag("changelogs-socket-path", "Path for changelogs socket (if enabled)").Default("/var/run/changelogs/changelogs.sock").Envar("CHANGELOGS_SOCKET_PATH").String()
 		logEncoding              = app.Flag("log-encoding", "Container logging output ending. Possible values: console, json").Default("console").Enum("console", "json")
 		enableSecretCache        = app.Flag("enable-secret-cache", "Enable caching of Secret objects. When true, Secrets are served from the informer cache instead of direct API calls. This reduces API server load but increases memory usage.").Default("true").Envar("ENABLE_SECRET_CACHE").Bool()
+
+		shardName        = app.Flag("shard-name", "Reconcile only Workspaces labelled "+workdir.ShardLabel+"=<name>, so several provider instances can run in parallel. Empty (the default) reconciles every Workspace. Requires the shard assigner to be writing the label.").Envar("SHARD_NAME").String()
+		gracefulShutdown = app.Flag("graceful-shutdown-timeout", "How long in-flight reconciles may finish after SIGTERM before the manager stops waiting. Set this above the p99 terraform apply duration: a terraform killed mid-apply leaves a stale backend lock that needs a manual force-unlock.").Default("10m").Duration()
 	)
 	kingpin.MustParse(app.Parse(os.Args[1:]))
 
@@ -110,6 +119,7 @@ func main() {
 	ctrl.SetLogger(zl)
 
 	log.Debug("Starting",
+		"shard", *shardName,
 		"sync-period", syncInterval.String(),
 		"poll-interval", pollInterval.String(),
 		"poll-jitter", pollJitter.String(),
@@ -140,17 +150,42 @@ func main() {
 	kingpin.FatalIfError(sourcev1beta2.AddToScheme(scheme), "Cannot add flux ocirepository APIs to scheme")
 	kingpin.FatalIfError(apiextensionsv1.AddToScheme(scheme), "Cannot register k8s apiextensions APIs to scheme")
 
+	byObject := map[client.Object]cache.ByObject{
+		&apiextensionsv1.CustomResourceDefinition{}: {
+			Transform: customresourcesgate.TransformStripCRDSchema,
+		},
+	}
+	leaderElectionID := "crossplane-leader-election-provider-terraform"
+
+	if *shardName != "" {
+		// Filter this instance's Workspace informers to its own shard, so
+		// cache memory and watch traffic scale with this shard's share rather
+		// than with the whole fleet. The shard assigner writes the label; a
+		// Workspace that has none is reconciled by no instance at all, which
+		// is what the assigner's unlabelled-Workspace alert catches.
+		sel := labels.SelectorFromSet(labels.Set{workdir.ShardLabel: *shardName})
+		byObject[&clusterv1beta1.Workspace{}] = cache.ByObject{Label: sel}
+		byObject[&namespacedv1beta1.Workspace{}] = cache.ByObject{Label: sel}
+
+		// Per-shard leases. A single fleet-wide lease would elect one leader
+		// across every shard and defeat the point of running several.
+		leaderElectionID += "-" + *shardName
+
+		log.Info("Sharding enabled", "shard", *shardName, "label", workdir.ShardLabel)
+	}
+
 	mgr, err := ctrl.NewManager(ratelimiter.LimitRESTConfig(cfg, *maxReconcileRate), ctrl.Options{
 		Scheme: scheme,
 		Cache: cache.Options{
 			SyncPeriod: syncInterval,
-			ByObject: map[client.Object]cache.ByObject{
-				&apiextensionsv1.CustomResourceDefinition{}: {
-					Transform: customresourcesgate.TransformStripCRDSchema,
-				},
-			},
+			ByObject:   byObject,
 		},
 		Client: clientOpts,
+
+		// SIGTERM should let an in-flight terraform apply finish. Killing one
+		// mid-apply leaves a stale backend lock that needs a manual
+		// force-unlock, which is how state actually gets damaged in practice.
+		GracefulShutdownTimeout: gracefulShutdown,
 
 		// controller-runtime uses both ConfigMaps and Leases for leader
 		// election by default. Leases expire after 15 seconds, with a
@@ -160,7 +195,7 @@ func main() {
 		// server. Switching to Leases only and longer leases appears to
 		// alleviate this.
 		LeaderElection:             *leaderElection,
-		LeaderElectionID:           "crossplane-leader-election-provider-terraform",
+		LeaderElectionID:           leaderElectionID,
 		LeaderElectionResourceLock: resourcelock.LeasesResourceLock,
 		LeaseDuration:              func() *time.Duration { d := 60 * time.Second; return &d }(),
 		RenewDeadline:              func() *time.Duration { d := 50 * time.Second; return &d }(),
@@ -170,8 +205,16 @@ func main() {
 	metricRecorder := managed.NewMRMetricRecorder()
 	stateMetrics := statemetrics.NewMRStateMetrics()
 
-	metrics.Registry.MustRegister(metricRecorder)
-	metrics.Registry.MustRegister(stateMetrics)
+	// Break every provider series out by shard, without touching a single
+	// metric definition: each instance serves exactly one shard, so the shard
+	// is a constant label on this process's registrations.
+	var reg prometheus.Registerer = metrics.Registry
+	if *shardName != "" {
+		reg = prometheus.WrapRegistererWith(prometheus.Labels{"shard": *shardName}, metrics.Registry)
+	}
+	tfmetrics.Register(reg)
+	reg.MustRegister(metricRecorder)
+	reg.MustRegister(stateMetrics)
 
 	ctx := context.Background()
 	clusterOpts := controller.Options{
@@ -222,7 +265,10 @@ func main() {
 
 	// NOTE: cluster-scoped and namespaced Workspaces share a common
 	// workspace root directory. Update GC setup if they diverge
-	kingpin.FatalIfError(gc.Setup(mgr, workspace.GetTerraformDir(), log, gc.WithInterval(*gcInterval)), "cannot setup Workspace garbage collector controller")
+	kingpin.FatalIfError(gc.Setup(mgr, workspace.GetTerraformDir(), log,
+		gc.WithInterval(*gcInterval),
+		gc.WithShardName(*shardName),
+	), "cannot setup Workspace garbage collector controller")
 	canSafeStart, err := canWatchCRD(ctx, mgr)
 	kingpin.FatalIfError(err, "SafeStart precheck failed")
 	if canSafeStart {
