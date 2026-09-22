@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: provider-terraform-shard-assigner
+  namespace: crossplane-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: provider-terraform-shard-assigner
+rules:
+  # The assigner reads every Workspace to balance across shards, and patches
+  # only metadata.labels and metadata.annotations. It never writes spec or
+  # status.
+  - apiGroups: ["tf.upbound.io", "tf.m.upbound.io"]
+    resources: ["workspaces"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: provider-terraform-shard-assigner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: provider-terraform-shard-assigner
+subjects:
+  - kind: ServiceAccount
+    name: provider-terraform-shard-assigner
+    namespace: crossplane-system
+---
+# Leader election. A second assigner writing labels concurrently would defeat
+# the single-writer premise the design rests on.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: provider-terraform-shard-assigner-leader-election
+  namespace: crossplane-system
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: provider-terraform-shard-assigner-leader-election
+  namespace: crossplane-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: provider-terraform-shard-assigner-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: provider-terraform-shard-assigner
+    namespace: crossplane-system
