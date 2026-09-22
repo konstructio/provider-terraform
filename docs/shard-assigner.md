@@ -31,7 +31,7 @@ and is still open; this fork does not depend on it.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--require-shard-offline` | `true` | Refuse to migrate a Workspace while its current shard still has a running pod. |
+| `--[no-]require-shard-offline` | on | Refuse to migrate a Workspace while its current shard still has a running pod. It is a kingpin boolean: `--no-require-shard-offline` turns it off, `=false` is rejected. |
 | `--pod-namespace` | `crossplane-system` | Where the sharded provider Deployments run. |
 | `--stale-migration` | `30m` | How long a Workspace that never syncs may block further migrations. |
 
@@ -107,7 +107,7 @@ Three properties worth knowing:
   the shard level, and why the shard's process must fully drain *before* it
   disappears.
 
-  `--require-shard-offline=false` opts out, and is only reasonable with backend
+  `--no-require-shard-offline` opts out, and is only reasonable with backend
   locking confirmed: S3 with a DynamoDB lock table or `use_lockfile = true`
   (Terraform ≥ 1.10), GCS, or azurerm — all of which lock natively. Local
   state, or S3 with neither mechanism, is genuinely corruptible under handover.
@@ -159,7 +159,7 @@ drive a drain it started itself. Same thing you would do for an HPA.
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--namespace` | `crossplane-system` | Where the shard Deployments and their pods live. |
-| `--require-shard-offline` | `true` | Refuse to migrate a Workspace while its current shard still has a running pod. |
+| `--[no-]require-shard-offline` | on | Refuse to migrate a Workspace while its current shard still has a running pod. It is a kingpin boolean: `--no-require-shard-offline` turns it off, `=false` is rejected. |
 | `--migration-batch` | `5` | How many Workspaces may migrate at once. |
 | `--stale-migration` | `30m` | How long a Workspace that never syncs may hold a batch slot. |
 
