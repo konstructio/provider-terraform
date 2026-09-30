@@ -78,9 +78,9 @@ spec:
             summary: A Workspace migration has not completed
             description: >-
               A Workspace has carried terraform.crossplane.io/migrating-at for
-              over 30 minutes without reaching Synced=True on its new shard.
-              Past this cutoff the assigner stops letting it hold a batch slot
-              and moves on, so check why that Workspace is not syncing.
+              over 30 minutes without its new shard picking it up. Past this
+              cutoff the assigner stops letting it hold a batch slot and moves
+              on, so check whether that shard is running and reconciling.
 
         - alert: TerraformShardImbalance
           expr: >-

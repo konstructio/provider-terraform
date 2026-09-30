@@ -58,10 +58,14 @@ const (
 	ShardLabel = workdir.ShardLabel
 
 	// MigratingAtAnnotation records when a Workspace was relabelled onto a
-	// new shard, RFC3339. It is present only between the relabel and the
-	// Workspace reporting Synced=True on its new owner, which is what makes
-	// the migration batch limit expressible level-triggered.
-	MigratingAtAnnotation = "terraform.crossplane.io/migrating-at"
+	// new shard, RFC3339. It is present only between the relabel and the new
+	// shard picking the Workspace up, which is what makes the migration batch
+	// limit expressible level-triggered.
+	MigratingAtAnnotation = workdir.MigratingAtAnnotation
+
+	// MigrationReceivedAnnotation is stamped by the new shard once it has set
+	// the Workspace up. Seeing it completes the migration.
+	MigrationReceivedAnnotation = workdir.MigrationReceivedAnnotation
 )
 
 // ShardName returns the canonical name of shard i.

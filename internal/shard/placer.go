@@ -98,6 +98,11 @@ type Placer struct {
 	// controllers share one Placer and each runs its own worker, so without
 	// this the batch limit can be exceeded by concurrent decisions.
 	mu sync.Mutex
+
+	// drainBlocked remembers which shards were last seen blocking a drain, so
+	// the wait is logged once when it starts and once when it clears. Guarded
+	// by mu.
+	drainBlocked map[string]bool
 }
 
 // A PlacerOption configures a Placer.
@@ -174,6 +179,7 @@ func NewPlacer(kube client.Reader, log logging.Logger, o ...PlacerOption) *Place
 		staleAfter:     DefaultStaleMigration,
 		cost:           func(Workspace) float64 { return 1 },
 		now:            time.Now,
+		drainBlocked:   map[string]bool{},
 	}
 	for _, fn := range o {
 		fn(p)
@@ -183,6 +189,20 @@ func NewPlacer(kube client.Reader, log logging.Logger, o ...PlacerOption) *Place
 
 // Batch returns the migration batch limit.
 func (p *Placer) Batch() int { return p.batch }
+
+// setDrainBlocked records whether shard is blocking a drain and reports
+// whether that changed. The caller must hold the placement lock.
+func (p *Placer) setDrainBlocked(shard string, blocked bool) bool {
+	if p.drainBlocked[shard] == blocked {
+		return false
+	}
+	if blocked {
+		p.drainBlocked[shard] = true
+	} else {
+		delete(p.drainBlocked, shard)
+	}
+	return true
+}
 
 // LoadFleet reads the declared shards straight off the shard Deployments.
 // There is no ConfigMap: spec.replicas is already the desired state, and
@@ -315,14 +335,18 @@ func (p *Placer) LeastLoaded(ctx context.Context, f Fleet) (string, error) {
 }
 
 // MigrationsInFlight counts Workspaces that have been relabelled onto a new
-// shard but have not yet reported Synced=True there. A migration whose
-// annotation is older than staleAfter, or unparseable, is logged and not
-// counted, so it cannot hold a batch slot forever.
+// shard which has not picked them up yet. A migration whose annotation is
+// older than staleAfter, or unparseable, is logged and not counted, so it
+// cannot hold a batch slot forever.
 func (p *Placer) MigrationsInFlight(ctx context.Context) (int, error) {
 	n := 0
 	err := p.forEach(ctx, func(ws Workspace) {
-		at, ok := ws.GetAnnotations()[MigratingAtAnnotation]
-		if !ok || Synced(ws) {
+		annotations := ws.GetAnnotations()
+		at, ok := annotations[MigratingAtAnnotation]
+		if !ok {
+			return
+		}
+		if _, received := annotations[MigrationReceivedAnnotation]; received {
 			return
 		}
 		started, err := time.Parse(time.RFC3339, at)
@@ -332,7 +356,7 @@ func (p *Placer) MigrationsInFlight(ctx context.Context) (int, error) {
 			return
 		}
 		if age := p.now().Sub(started); age > p.staleAfter {
-			p.log.Info("Migration is stale and no longer holds a batch slot; the workspace has not synced on its new shard",
+			p.log.Info("Migration is stale and no longer holds a batch slot; its new shard has not picked the workspace up",
 				"workspace", ws.GetName(), "shard", ws.GetLabels()[ShardLabel],
 				"age", age.String(), "cutoff", p.staleAfter.String())
 			return

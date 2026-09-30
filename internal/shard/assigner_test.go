@@ -113,6 +113,19 @@ func migratingRaw(v string) func(client.Object) {
 	return func(o client.Object) { o.SetAnnotations(map[string]string{MigratingAtAnnotation: v}) }
 }
 
+// received stamps the new shard's receipt on top of whatever annotations the
+// Workspace already carries.
+func received() func(client.Object) {
+	return func(o client.Object) {
+		a := o.GetAnnotations()
+		if a == nil {
+			a = map[string]string{}
+		}
+		a[MigrationReceivedAnnotation] = testNow.UTC().Format(time.RFC3339)
+		o.SetAnnotations(a)
+	}
+}
+
 func synced() func(client.Object) {
 	return func(o client.Object) {
 		c := xpv2.Condition{Type: xpv2.TypeSynced, Status: corev1.ConditionTrue}
@@ -236,6 +249,9 @@ func TestReconcile(t *testing.T) {
 		shard string
 		// migratingSet is whether the patch carried a migrating-at annotation.
 		migratingSet bool
+		// receivedSet is whether the patch carried a migration-received
+		// annotation.
+		receivedSet bool
 		// patches is how many Patch calls were made.
 		patches int
 		wantErr bool
@@ -276,6 +292,15 @@ func TestReconcile(t *testing.T) {
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
 			want: want{shard: "shard-0", migratingSet: true, patches: 1},
 		},
+		"RelabelDropsAnOldReceipt": {
+			reason: "A receipt left from an earlier migration would complete the new one before its new shard has seen it.",
+			fixture: fixture{
+				deployments: append(shardDeploys("shard-0"), shardDeploy("shard-1", 0)),
+				cluster:     []clusterv1beta1.Workspace{cws("a", "shard-1", migrating(testNow.Add(-1*time.Hour)), received())},
+			},
+			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
+			want: want{shard: "shard-0", migratingSet: true, receivedSet: false, patches: 1},
+		},
 		"OutOfRangeShardMigrates": {
 			reason: "Dropping shardCount moves Workspaces off the shards that no longer exist.",
 			fixture: fixture{
@@ -307,8 +332,19 @@ func TestReconcile(t *testing.T) {
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "waiting"}},
 			want: want{shard: "shard-0", migratingSet: true, patches: 1},
 		},
-		"SyncedMigrationsDoNotHoldBatchSlots": {
-			reason: "A migration that has landed no longer occupies a slot, even before its annotation is cleared.",
+		"ReceivedMigrationsDoNotHoldBatchSlots": {
+			reason: "A migration the new shard has picked up no longer occupies a slot, even before its annotations are cleared.",
+			fixture: fixture{
+				deployments: append(shardDeploys("shard-0"), shardDeploy("shard-1", 0)),
+				cluster: append(migratingWorkspaces(DefaultMigrationBatch, received()),
+					cws("waiting", "shard-1"),
+				),
+			},
+			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "waiting"}},
+			want: want{shard: "shard-0", migratingSet: true, patches: 1},
+		},
+		"SyncedButNotReceivedStillHoldsSlot": {
+			reason: "A Workspace that was Synced=True on its old shard still reads Synced=True after the relabel; that must not free its slot before the new shard has picked it up.",
 			fixture: fixture{
 				deployments: append(shardDeploys("shard-0"), shardDeploy("shard-1", 0)),
 				cluster: append(migratingWorkspaces(DefaultMigrationBatch, synced()),
@@ -316,7 +352,7 @@ func TestReconcile(t *testing.T) {
 				),
 			},
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "waiting"}},
-			want: want{shard: "shard-0", migratingSet: true, patches: 1},
+			want: want{result: reconcile.Result{RequeueAfter: RequeueMigration}, patches: 0},
 		},
 		"MigrationInFlightDoesNotBlockFirstPlacement": {
 			reason: "An unlabelled Workspace is reconciled by nobody, so it is placed even mid-drain.",
@@ -351,20 +387,20 @@ func TestReconcile(t *testing.T) {
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "waiting"}},
 			want: want{shard: "shard-0", migratingSet: true, patches: 1},
 		},
-		"SyncedMigrationClearsAnnotation": {
-			reason: "Reaching Synced=True on the new shard completes the migration and releases the gate.",
+		"ReceivedMigrationClearsAnnotations": {
+			reason: "The new shard's receipt completes the migration: both annotations are removed and the slot is released.",
 			fixture: fixture{
 				deployments: shardDeploys("shard-0", "shard-1"),
-				cluster:     []clusterv1beta1.Workspace{cws("a", "shard-0", migrating(testNow.Add(-1*time.Minute)), synced())},
+				cluster:     []clusterv1beta1.Workspace{cws("a", "shard-0", migrating(testNow.Add(-1*time.Minute)), received())},
 			},
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
 			want: want{shard: "shard-0", patches: 1},
 		},
-		"UnsyncedMigrationKeepsAnnotation": {
-			reason: "The annotation stays until the Workspace actually syncs on its new shard.",
+		"SyncedMigrationWithoutReceiptKeepsAnnotation": {
+			reason: "Synced=True carried over from the old shard is not a handover; the migration stays open until the new shard's receipt.",
 			fixture: fixture{
 				deployments: shardDeploys("shard-0", "shard-1"),
-				cluster:     []clusterv1beta1.Workspace{cws("a", "shard-0", migrating(testNow.Add(-1*time.Minute)))},
+				cluster:     []clusterv1beta1.Workspace{cws("a", "shard-0", migrating(testNow.Add(-1*time.Minute)), synced())},
 			},
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
 			want: want{patches: 0},
@@ -533,6 +569,10 @@ func TestReconcile(t *testing.T) {
 			if gotMigrating != tc.want.migratingSet {
 				t.Errorf("Reconcile(...): want migrating-at set=%v, got %v\n%s", tc.want.migratingSet, gotMigrating, tc.reason)
 			}
+			_, gotReceived := p.GetAnnotations()[MigrationReceivedAnnotation]
+			if gotReceived != tc.want.receivedSet {
+				t.Errorf("Reconcile(...): want migration-received set=%v, got %v\n%s", tc.want.receivedSet, gotReceived, tc.reason)
+			}
 		})
 	}
 }
@@ -682,5 +722,29 @@ func TestInstalledKinds(t *testing.T) {
 				t.Errorf("installedKinds(...): -want, +got:\n%s\n%s", diff, tc.reason)
 			}
 		})
+	}
+}
+
+// TestSetDrainBlocked checks the drain wait is reported once when it starts and
+// once when it clears, not on every 30s re-check of every Workspace.
+func TestSetDrainBlocked(t *testing.T) {
+	p := NewPlacer(nil, logging.NewNopLogger())
+
+	steps := []struct {
+		shard   string
+		blocked bool
+		changed bool
+	}{
+		{"shard-8", true, true},   // wait starts: log it
+		{"shard-8", true, false},  // next Workspace, same wait: quiet
+		{"shard-9", true, true},   // a second shard is tracked separately
+		{"shard-8", false, true},  // pod gone: log it
+		{"shard-8", false, false}, // stays clear: quiet
+		{"shard-3", false, false}, // never blocked: nothing to report
+	}
+	for i, s := range steps {
+		if got := p.setDrainBlocked(s.shard, s.blocked); got != s.changed {
+			t.Errorf("step %d: setDrainBlocked(%q, %v) = %v, want %v", i, s.shard, s.blocked, got, s.changed)
+		}
 	}
 }

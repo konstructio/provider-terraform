@@ -18,7 +18,6 @@ package shard
 
 import (
 	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
-	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	clusterv1beta1 "github.com/upbound/provider-terraform/apis/cluster/v1beta1"
@@ -26,16 +25,10 @@ import (
 )
 
 // A Workspace is the part of the two generated Workspace types this package
-// needs: object metadata, plus the Synced condition that tells us a migration
-// has landed on its new shard.
+// needs.
 type Workspace interface {
 	client.Object
 	GetCondition(xpv2.ConditionType) xpv2.Condition
-}
-
-// Synced reports whether ws has reached Synced=True.
-func Synced(ws Workspace) bool {
-	return ws.GetCondition(xpv2.TypeSynced).Status == corev1.ConditionTrue
 }
 
 // A Kind adapts one of the two Workspace API types to the assigner. The

@@ -56,7 +56,7 @@ var (
 	WorkspacesMigrating = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "terraform_shard_workspaces_migrating",
-			Help: "Number of Workspaces relabelled onto a new shard but not yet synced there",
+			Help: "Number of Workspaces relabelled onto a new shard that has not picked them up yet",
 		},
 	)
 
@@ -91,12 +91,12 @@ var (
 		[]string{"from", "to"},
 	)
 
-	// MigrationsCompleted counts migrations that reached Synced=True on the
+	// MigrationsCompleted counts migrations whose new shard picked up the
 	// target shard.
 	MigrationsCompleted = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "terraform_shard_migrations_completed_total",
-			Help: "Total Workspace migrations that synced on their target shard",
+			Help: "Total Workspace migrations picked up by their target shard",
 		},
 		[]string{"shard"},
 	)

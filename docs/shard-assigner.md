@@ -200,9 +200,18 @@ Workspaces do not arrive as one burst of `terraform init` on the receiving
 shards, which serialise on the provider's plugin-cache lock. Strictly one at a
 time would make a 40-Workspace drain take over an hour for no safety benefit.
 
-A migration that never reaches `SYNCED=True` stops holding its slot after
-`--stale-migration` (default 30m); the assigner logs loudly and moves on, so one
-permanently broken Workspace cannot wedge a drain.
+A migration is complete once the new shard has set the Workspace up —
+attempted `terraform init`, successful or not — which it records by stamping
+`terraform.crossplane.io/migration-received`. The assigner then removes both
+annotations and frees the slot. It deliberately does not wait for
+`Synced=True`: a Workspace that was synced on its old shard still reads
+`Synced=True` the moment it is relabelled, so that would complete every healthy
+migration before the new shard had touched it and let a whole drain through at
+once.
+
+A migration the new shard never picks up stops holding its slot after
+`--stale-migration` (default 30m); the assigner logs loudly and moves on, so a
+wedged receiving shard cannot stall a drain forever.
 
 ## Rollout
 
@@ -229,7 +238,7 @@ permanently broken Workspace cannot wedge a drain.
 | `terraform_shard_drain_blocked{shard}` | gauge | 1 while a draining shard still has a running pod |
 | `terraform_shard_without_pods{shard}` | gauge | 1 while an active shard has no running pod |
 | `terraform_shard_migrations_started_total{from,to}` | counter | Relabels performed |
-| `terraform_shard_migrations_completed_total{shard}` | counter | Migrations that synced |
+| `terraform_shard_migrations_completed_total{shard}` | counter | Migrations picked up by their new shard |
 
 Every provider-side metric — `terraform_provider_*`, plus Crossplane's managed
 resource and state metrics — carries a constant `shard` label on a sharded

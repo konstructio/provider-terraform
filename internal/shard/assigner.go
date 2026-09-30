@@ -107,11 +107,20 @@ func (a *Assigner) Reconcile(ctx context.Context, req reconcile.Request) (reconc
 			}
 			if online {
 				ShardDrainBlocked.WithLabelValues(cur).Set(1)
+				// Every Workspace on the shard re-checks every 30s, so log the
+				// wait once per shard rather than once per Workspace per check.
+				if a.placer.setDrainBlocked(cur, true) {
+					a.log.Info("Not migrating off a shard whose pod is still running; waiting for it to exit",
+						"shard", cur)
+				}
 				a.log.Debug("Not migrating: the current shard still has a running pod",
 					"workspace", ws.GetName(), "shard", cur)
 				return reconcile.Result{RequeueAfter: RequeueShardOnline}, nil
 			}
 			ShardDrainBlocked.WithLabelValues(cur).Set(0)
+			if a.placer.setDrainBlocked(cur, false) {
+				a.log.Info("Shard's pod has exited; migrating its Workspaces", "shard", cur)
+			}
 		}
 
 		// Cap how many migrate at once. Overlap is not the concern here - the
@@ -158,6 +167,9 @@ func (a *Assigner) assign(ctx context.Context, ws Workspace, cur, target string)
 			annotations = map[string]string{}
 		}
 		annotations[MigratingAtAnnotation] = a.now().UTC().Format(time.RFC3339)
+		// A receipt left from an earlier migration would complete this one
+		// before the new shard has seen it.
+		delete(annotations, MigrationReceivedAnnotation)
 		ws.SetAnnotations(annotations)
 	}
 
@@ -176,14 +188,19 @@ func (a *Assigner) assign(ctx context.Context, ws Workspace, cur, target string)
 	return nil
 }
 
-// completeMigration clears the migrating-at annotation once the Workspace has
-// reported Synced=True on its new shard, which releases the gate for the next
-// migration. It is a no-op for a Workspace that is not migrating.
+// completeMigration clears the migration annotations once the new shard has
+// stamped MigrationReceivedAnnotation, which releases the batch slot for the
+// next migration. It is a no-op for a Workspace that is not migrating.
+//
+// It deliberately does not look at Synced: a Workspace that was Synced=True on
+// its old shard still reads Synced=True the instant it is relabelled, so that
+// would complete every healthy migration before the new shard had run it.
 func (a *Assigner) completeMigration(ctx context.Context, ws Workspace) error {
-	if _, ok := ws.GetAnnotations()[MigratingAtAnnotation]; !ok {
+	annotations := ws.GetAnnotations()
+	if _, ok := annotations[MigratingAtAnnotation]; !ok {
 		return nil
 	}
-	if !Synced(ws) {
+	if _, ok := annotations[MigrationReceivedAnnotation]; !ok {
 		return nil
 	}
 
@@ -193,8 +210,8 @@ func (a *Assigner) completeMigration(ctx context.Context, ws Workspace) error {
 	}
 	patch := client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})
 
-	annotations := ws.GetAnnotations()
 	delete(annotations, MigratingAtAnnotation)
+	delete(annotations, MigrationReceivedAnnotation)
 	ws.SetAnnotations(annotations)
 
 	if err := a.kube.Patch(ctx, ws, patch); err != nil {
@@ -203,7 +220,7 @@ func (a *Assigner) completeMigration(ctx context.Context, ws Workspace) error {
 
 	shard := ws.GetLabels()[ShardLabel]
 	MigrationsCompleted.WithLabelValues(shard).Inc()
-	a.log.Info("Workspace synced on its new shard; migration complete",
+	a.log.Info("Workspace picked up by its new shard; migration complete",
 		"kind", a.kind.Name, "workspace", ws.GetName(), "shard", shard)
 	return nil
 }

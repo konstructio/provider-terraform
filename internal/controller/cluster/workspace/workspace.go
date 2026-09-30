@@ -51,6 +51,7 @@ import (
 	"github.com/upbound/provider-terraform/internal/features"
 	"github.com/upbound/provider-terraform/internal/githubapp"
 	"github.com/upbound/provider-terraform/internal/terraform"
+	"github.com/upbound/provider-terraform/internal/workdir"
 	"github.com/upbound/provider-terraform/pkg/metrics"
 
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
@@ -203,6 +204,16 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		return nil, errors.New(errNotWorkspace)
 	}
 	l := c.logger.WithValues("request", map[string]string{"name": cr.Name})
+	// On a Workspace the shard assigner just moved here, record that this
+	// shard has picked it up once setup - including terraform init - has been
+	// attempted, successful or not. That releases the assigner's migration
+	// batch slot; a failure is not worth failing the reconcile over, since the
+	// assigner stops counting the migration after --stale-migration anyway.
+	defer func() {
+		if err := workdir.MarkMigrationReceived(ctx, c.kube, cr, time.Now()); err != nil {
+			l.Debug("Cannot mark migration received", "error", err)
+		}
+	}()
 	// NOTE(negz): This directory will be garbage collected by the workdir
 	// garbage collector that is started in Setup.
 	dir := filepath.Join(tfDir, string(cr.GetUID()))
