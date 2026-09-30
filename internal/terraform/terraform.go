@@ -749,34 +749,41 @@ func (h Harness) Destroy(ctx context.Context, ws string, o ...Option) error {
 	return Classify(err)
 }
 
-// GroupTermGrace is how long a cancelled command's process group has to exit
-// after SIGTERM before the runtime force-kills it.
-const GroupTermGrace = 30 * time.Second
+// InterruptGrace is how long a cancelled command has to exit after SIGINT
+// before it is force-killed. terraform's graceful stop waits for the resource
+// operations already in flight, which for EKS or RDS can take minutes, so this
+// is minutes too. Keep it below --graceful-shutdown-timeout (default 10m), or a
+// pod shutdown stops waiting for the command before the command has stopped.
+//
+// A variable only so tests can shorten it.
+var InterruptGrace = 5 * time.Minute
 
-// newCommand returns a command whose children run in their own process group,
-// and whose cancellation signals that whole group.
+// newCommand returns a command that runs in its own process group and is
+// stopped gracefully when ctx is done.
 //
-// terraform spawns terraform-provider-* plugins, and /bin/sh spawns the
-// checksum pipeline. Signalling only the direct child leaves those
-// grandchildren orphaned: they reparent to PID 1 - which is this provider,
-// running without an init that reaps - and become zombies. cgroup v2 charges a
-// zombie against pids.current until it is reaped, so they accumulate
-// invisibly (they are not listed in cgroup.procs) until the container can no
-// longer fork.
+// Cancellation sends one SIGINT to the direct child only - what Ctrl-C does.
+// terraform treats it as "stop starting new operations, finish those in
+// flight, write state, release the lock", and stops its own provider plugins
+// over RPC once they have reported back. Signalling the whole group instead
+// hits those plugins directly: go-plugin ignores only SIGINT, so a SIGTERM
+// kills terraform-provider-aws mid-call and terraform never learns the result
+// of a create already in progress in AWS - the resource is orphaned or left
+// tainted. A second SIGINT would make terraform exit immediately, which is
+// why exactly one is sent.
 //
-// It also matters for sharding: a handover assumes that once a shard's pod is
-// gone no terraform of its is still running. Without a process group, killing
-// the provider leaves the apply running.
+// The process group is for what outlives that: runCommand SIGKILLs it once the
+// command has exited, so stray plugins or checksum-pipeline children do not
+// linger as orphans, and a shard's pod being gone still means none of its
+// terraform processes is running.
 func newCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, name, args...) //nolint:gosec // see the G204 note above
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	// Replace CommandContext's default cancel, which SIGKILLs the direct child
-	// only. WaitDelay then bounds how long we wait before the runtime gives up
-	// and force-kills it, so Wait cannot block forever on a child that ignores
-	// SIGTERM.
-	cmd.Cancel = func() error { return killGroup(cmd, syscall.SIGTERM) }
-	cmd.WaitDelay = GroupTermGrace
+	// Replace CommandContext's default cancel, which SIGKILLs the child.
+	// WaitDelay then bounds the graceful stop: if the child has not exited
+	// by then, the runtime SIGKILLs it, so Wait cannot block forever.
+	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
+	cmd.WaitDelay = InterruptGrace
 
 	return cmd
 }
@@ -802,7 +809,8 @@ type cmdResult struct {
 }
 
 // runCommand executes the requested command. If the context finishes first,
-// the command's whole process group is terminated.
+// the command is interrupted and, once it has exited, anything left in its
+// process group is killed.
 func runCommand(ctx context.Context, c *exec.Cmd) ([]byte, error) {
 	ch := make(chan cmdResult, 1)
 	go func() {
@@ -811,11 +819,20 @@ func runCommand(ctx context.Context, c *exec.Cmd) ([]byte, error) {
 	}()
 	select {
 	case <-ctx.Done():
-		// c.Cancel has already SIGTERMed the process group and c.WaitDelay
-		// bounds how long the runtime waits before force-killing it, so all
-		// that is left is to let c.Output()'s own Wait return. Calling
-		// c.Wait() here as well would race that one.
+		// c.Cancel has already sent SIGINT and c.WaitDelay bounds how long
+		// the runtime waits before force-killing the child, so let
+		// c.Output()'s own Wait return. Calling c.Wait() here as well would
+		// race that one.
 		<-ch
+		// The child has exited and been reaped; its group lives on only while
+		// a member does, so this reaches just the leftovers - a plugin that
+		// outlived a force-kill, say. ESRCH means there were none.
+		//
+		// A leftover still holding the child's stdout keeps c.Output() from
+		// returning until WaitDelay closes the pipes. terraform's plugins and
+		// git run with their own pipes, so in practice that wait does not
+		// happen, and it is bounded by InterruptGrace when it does.
+		_ = killGroup(c, syscall.SIGKILL)
 		return nil, errors.Wrap(ctx.Err(), errRunCommand)
 	case res := <-ch:
 		// c.Output() records the command's stderr on the *exec.ExitError, but

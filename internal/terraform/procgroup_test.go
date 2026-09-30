@@ -67,8 +67,9 @@ func TestCancelKillsGrandchildren(t *testing.T) {
 	defer cancel()
 
 	// A shell that backgrounds a long sleep, reports its PID, and waits -
-	// the shape of terraform holding a provider plugin open.
-	cmd := newCommand(ctx, "/bin/sh", "-c", "sleep 120 & echo $! > "+pidFile+"; wait")
+	// the shape of terraform holding a provider plugin open. Like a real
+	// plugin, the sleep has its own stdio rather than the shell's stdout.
+	cmd := newCommand(ctx, "/bin/sh", "-c", "sleep 120 >/dev/null 2>&1 & echo $! > "+pidFile+"; wait")
 
 	done := make(chan error, 1)
 	go func() {
@@ -99,6 +100,114 @@ func TestCancelKillsGrandchildren(t *testing.T) {
 	_ = syscall.Kill(pid, syscall.SIGKILL)
 	t.Errorf("grandchild %d survived cancellation of its parent; the process group was not signalled, "+
 		"so it would orphan to PID 1 and leak a PID", pid)
+}
+
+// TestCancelInterruptsOnlyTheDirectChild is the regression test for plugins
+// being killed mid-operation.
+//
+// terraform stops its provider plugins itself, over RPC, after they report
+// back. If the cancellation signal reaches the plugins directly they die with
+// the result of an in-flight create unreported, and the resource is orphaned.
+// So when the child handles the interrupt, its own child - standing in for
+// terraform-provider-aws - must still be running.
+func TestCancelInterruptsOnlyTheDirectChild(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "pid")
+	seen := filepath.Join(dir, "seen")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// On SIGINT, record whether the backgrounded "plugin" is still alive,
+	// then exit - terraform finishing its graceful stop.
+	script := `trap 'if kill -0 "$p" 2>/dev/null; then echo alive; else echo dead; fi > ` + seen + `; exit 0' INT
+sleep 120 >/dev/null 2>&1 & p=$!
+echo "$p" > ` + pidFile + `
+wait`
+	cmd := newCommand(ctx, "/bin/sh", "-c", script)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := runCommand(ctx, cmd)
+		done <- err
+	}()
+
+	pid := grandchildPID(t, pidFile)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("runCommand did not return after the context was cancelled")
+	}
+
+	b, err := os.ReadFile(seen)
+	switch {
+	case err != nil:
+		t.Fatalf("the child never ran its SIGINT handler (%v); cancellation must send SIGINT, not SIGTERM or SIGKILL", err)
+	case strings.TrimSpace(string(b)) != "alive":
+		t.Errorf("the child's child was %q when the child handled SIGINT, want alive; "+
+			"the signal reached the whole group, which would kill terraform's provider plugins mid-call",
+			strings.TrimSpace(string(b)))
+	}
+
+	// Once the child has exited, the leftover is cleaned up.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if !alive(pid) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	t.Errorf("grandchild %d survived after its parent exited; the process group was not killed", pid)
+}
+
+// TestCancelForceKillsAfterInterruptGrace checks that a command which does not
+// stop on SIGINT is still stopped: after InterruptGrace the child is killed,
+// and so is everything in its group.
+func TestCancelForceKillsAfterInterruptGrace(t *testing.T) {
+	saved := InterruptGrace
+	InterruptGrace = 500 * time.Millisecond
+	defer func() { InterruptGrace = saved }()
+
+	pidFile := filepath.Join(t.TempDir(), "pid")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Ignores SIGINT entirely, like a terraform wedged on a provider call.
+	cmd := newCommand(ctx, "/bin/sh", "-c", `trap '' INT; sleep 120 >/dev/null 2>&1 & echo $! > `+pidFile+`; wait`)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := runCommand(ctx, cmd)
+		done <- err
+	}()
+
+	pid := grandchildPID(t, pidFile)
+	start := time.Now()
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("runCommand did not return; WaitDelay did not bound the graceful stop")
+	}
+	if waited := time.Since(start); waited < InterruptGrace {
+		t.Errorf("runCommand returned after %v, before InterruptGrace (%v); the child was not given its graceful stop",
+			waited, InterruptGrace)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if !alive(pid) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	t.Errorf("grandchild %d survived the force-kill; the process group was not killed", pid)
 }
 
 // TestCancelledCommandRunsInItsOwnGroup checks the property the kill relies on:
