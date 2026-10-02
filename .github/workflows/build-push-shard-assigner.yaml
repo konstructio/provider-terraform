@@ -24,9 +24,13 @@ on:
       - 'feat/**'
     tags:
       - 'v*'
+    # Every in-repo package the assigner compiles in, so a change to any of
+    # them rebuilds it. Check with:
+    #   go list -deps ./cmd/shard-assigner | grep provider-terraform/
     paths:
       - 'cmd/shard-assigner/**'
       - 'internal/shard/**'
+      - 'internal/workdir/**'
       - 'apis/**'
       - 'Dockerfile.shard-assigner'
       - 'go.mod'
