@@ -85,13 +85,7 @@ func (a *Assigner) Reconcile(ctx context.Context, req reconcile.Request) (reconc
 	cur := ws.GetLabels()[ShardLabel]
 	if fleet.Active(cur) {
 		// Happy path, and where the overwhelming majority of calls end.
-		if err := a.completeMigration(ctx, ws); err != nil {
-			return reconcile.Result{}, err
-		}
-		if !a.placer.rebalance {
-			return reconcile.Result{}, nil
-		}
-		return a.rebalance(ctx, fleet, ws, cur)
+		return a.placed(ctx, fleet, ws, cur)
 	}
 
 	// Needs placement: unlabelled, or its owner is draining or out of range.
@@ -147,6 +141,19 @@ func (a *Assigner) Reconcile(ctx context.Context, req reconcile.Request) (reconc
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, a.assign(ctx, ws, cur, target)
+}
+
+// placed handles a Workspace already on an active shard: it closes a migration
+// the new shard has picked up and, with rebalancing on, may move the Workspace
+// to a less-loaded shard.
+func (a *Assigner) placed(ctx context.Context, fleet Fleet, ws Workspace, cur string) (reconcile.Result, error) {
+	if err := a.completeMigration(ctx, ws); err != nil {
+		return reconcile.Result{}, err
+	}
+	if !a.placer.rebalance {
+		return reconcile.Result{}, nil
+	}
+	return a.rebalance(ctx, fleet, ws, cur)
 }
 
 // rebalance moves a Workspace off its active shard when that shard carries
