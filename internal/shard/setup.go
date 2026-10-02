@@ -41,6 +41,12 @@ const DefaultCensusInterval = 30 * time.Second
 // which leaves the assigner nothing to place.
 const errNoWorkspaceAPI = "no Workspace API is installed; nothing to place"
 
+const (
+	errRebalanceNeedsLocking = "rebalancing moves Workspaces off shards that are still running, so it requires " +
+		"--no-require-shard-offline, which is only safe when the Terraform backend locks state (S3 use_lockfile or a DynamoDB table, GCS, azurerm)"
+	errRebalanceTolerance = "rebalance tolerance must be at least 1, or a Workspace bounces between two shards one apart"
+)
+
 // installedKinds returns the Workspace kinds the cluster serves. A kind whose
 // CRD is absent is logged and dropped rather than treated as an error: a
 // cluster may legitimately serve only one of the two.
@@ -86,6 +92,31 @@ type SetupOptions struct {
 	// shard still has a running pod. Keep it on unless the Terraform backend
 	// is confirmed to lock state.
 	RequireShardOffline bool
+
+	// Rebalance moves Workspaces off a shard carrying more than
+	// RebalanceTolerance more Workspaces than the least-loaded one, so a
+	// scale-up spreads existing Workspaces onto the new shards instead of
+	// only new ones. It moves them off live shards, so it requires
+	// RequireShardOffline to be false: the backend must lock state.
+	Rebalance bool
+
+	// RebalanceTolerance is how much busier than the least-loaded shard a
+	// shard may be before Workspaces move off it. At least 1.
+	RebalanceTolerance int
+}
+
+// validate rejects option combinations that would be unsafe or unstable.
+func (o SetupOptions) validate() error {
+	if !o.Rebalance {
+		return nil
+	}
+	if o.RequireShardOffline {
+		return errors.New(errRebalanceNeedsLocking)
+	}
+	if o.RebalanceTolerance < 1 {
+		return errors.New(errRebalanceTolerance)
+	}
+	return nil
 }
 
 // Setup registers an assigner for every Workspace kind, plus the periodic
@@ -94,6 +125,9 @@ type SetupOptions struct {
 // The manager's cache must NOT be shard filtered: the assigner balances across
 // shards, so it must see every Workspace.
 func Setup(mgr ctrl.Manager, log logging.Logger, o SetupOptions) error {
+	if err := o.validate(); err != nil {
+		return err
+	}
 	if o.StaleMigration == 0 {
 		o.StaleMigration = DefaultStaleMigration
 	}
@@ -118,7 +152,7 @@ func Setup(mgr ctrl.Manager, log logging.Logger, o SetupOptions) error {
 		return errors.New(errNoWorkspaceAPI)
 	}
 
-	placer := NewPlacer(mgr.GetClient(), log,
+	po := []PlacerOption{
 		WithKinds(kinds),
 		WithNamespace(o.Namespace),
 		WithStaleMigration(o.StaleMigration),
@@ -129,7 +163,11 @@ func Setup(mgr ctrl.Manager, log logging.Logger, o SetupOptions) error {
 		// answered from a possibly stale cache - and caching every Pod in the
 		// cluster would be a serious memory cost for one boolean.
 		WithPodReader(mgr.GetAPIReader()),
-	)
+	}
+	if o.Rebalance {
+		po = append(po, WithRebalance(o.RebalanceTolerance))
+	}
+	placer := NewPlacer(mgr.GetClient(), log, po...)
 
 	for _, k := range kinds {
 		a := NewAssigner(mgr.GetClient(), k, placer, log.WithValues("kind", k.Name))

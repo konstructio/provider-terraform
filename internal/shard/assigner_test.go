@@ -508,6 +508,58 @@ func TestReconcile(t *testing.T) {
 			req:  reconcile.Request{NamespacedName: types.NamespacedName{Name: "new"}},
 			want: want{shard: "shard-0", patches: 1},
 		},
+		"RebalanceOffByDefault": {
+			reason: "Without --rebalance an overloaded shard keeps its Workspaces; placement stays sticky.",
+			fixture: fixture{
+				deployments: shardDeploys("shard-0", "shard-1"),
+				cluster:     []clusterv1beta1.Workspace{cws("a", "shard-0"), cws("b", "shard-0"), cws("c", "shard-0")},
+			},
+			placerOpts: []PlacerOption{WithRequireShardOffline(false)},
+			req:        reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
+			want:       want{patches: 0},
+		},
+		"RebalanceMovesOffOverloadedShard": {
+			reason: "After a scale-up the new shard is empty; a Workspace on a shard more than the tolerance busier moves there.",
+			fixture: fixture{
+				deployments: shardDeploys("shard-0", "shard-1"),
+				cluster:     []clusterv1beta1.Workspace{cws("a", "shard-0"), cws("b", "shard-0"), cws("c", "shard-0")},
+			},
+			placerOpts: []PlacerOption{WithRequireShardOffline(false), WithRebalance(1)},
+			req:        reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
+			want:       want{shard: "shard-1", migratingSet: true, patches: 1},
+		},
+		"RebalanceWithinToleranceStays": {
+			reason: "A gap no larger than the tolerance is balanced enough; moving would only swap the imbalance.",
+			fixture: fixture{
+				deployments: shardDeploys("shard-0", "shard-1"),
+				cluster:     []clusterv1beta1.Workspace{cws("a", "shard-0"), cws("b", "shard-0"), cws("c", "shard-1")},
+			},
+			placerOpts: []PlacerOption{WithRequireShardOffline(false), WithRebalance(1)},
+			req:        reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
+			want:       want{patches: 0},
+		},
+		"RebalanceRespectsBatch": {
+			reason: "Rebalancing shares the migration batch, so it cannot flood the receiving shards with terraform init.",
+			fixture: fixture{
+				deployments: shardDeploys("shard-0", "shard-1"),
+				cluster:     append(migratingWorkspaces(DefaultMigrationBatch), cws("a", "shard-0")),
+			},
+			placerOpts: []PlacerOption{WithRequireShardOffline(false), WithRebalance(1)},
+			req:        reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
+			want:       want{result: reconcile.Result{RequeueAfter: RequeueMigration}, patches: 0},
+		},
+		"RebalanceLeavesASettlingWorkspace": {
+			reason: "A Workspace its new shard has not picked up yet must not be moved again.",
+			fixture: fixture{
+				deployments: shardDeploys("shard-0", "shard-1"),
+				cluster: []clusterv1beta1.Workspace{
+					cws("a", "shard-0", migrating(testNow.Add(-1*time.Minute))), cws("b", "shard-0"), cws("c", "shard-0"),
+				},
+			},
+			placerOpts: []PlacerOption{WithRequireShardOffline(false), WithRebalance(1)},
+			req:        reconcile.Request{NamespacedName: types.NamespacedName{Name: "a"}},
+			want:       want{patches: 0},
+		},
 		"BalancesAcrossBothKinds": {
 			reason: "A shard reconciles both Workspace kinds, so load must be counted across both.",
 			fixture: fixture{
@@ -746,5 +798,87 @@ func TestSetDrainBlocked(t *testing.T) {
 		if got := p.setDrainBlocked(s.shard, s.blocked); got != s.changed {
 			t.Errorf("step %d: setDrainBlocked(%q, %v) = %v, want %v", i, s.shard, s.blocked, got, s.changed)
 		}
+	}
+}
+
+// TestRebalanceConverges runs the assigner over a scale-up until nothing moves,
+// with each moved Workspace picked up by its new shard straight away. It must
+// end balanced within the tolerance, and then stay put: no Workspace may bounce
+// between shards.
+func TestRebalanceConverges(t *testing.T) {
+	f := fixture{deployments: shardDeploys("shard-0", "shard-1", "shard-2")}
+	for i := range 7 {
+		f.cluster = append(f.cluster, cws(fmt.Sprintf("w%d", i), "shard-0"))
+	}
+	f.pods = shardPods("shard-0", "shard-1", "shard-2")
+
+	moves := 0
+	for round := range 20 {
+		moved := false
+		for i := range f.cluster {
+			var patched []client.Object
+			a := testAssigner(f, ClusterKind(), &patched, WithRequireShardOffline(false), WithRebalance(1))
+			if _, err := a.Reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Name: f.cluster[i].Name}}); err != nil {
+				t.Fatalf("round %d: Reconcile(%s): %v", round, f.cluster[i].Name, err)
+			}
+			for _, p := range patched {
+				f.cluster[i].SetLabels(p.GetLabels())
+				// The new shard picks it up at once, and the assigner clears
+				// the annotations on its next look.
+				f.cluster[i].SetAnnotations(nil)
+				moved = true
+				moves++
+			}
+		}
+		if !moved {
+			break
+		}
+	}
+
+	count := map[string]int{}
+	for _, w := range f.cluster {
+		count[w.GetLabels()[ShardLabel]]++
+	}
+	if diff := cmp.Diff(map[string]int{"shard-0": 3, "shard-1": 2, "shard-2": 2}, count); diff != "" {
+		t.Errorf("after rebalancing, -want per-shard count, +got:\n%s", diff)
+	}
+	// 7 on one shard spreads to 3/2/2 with exactly 4 moves; any more means a
+	// Workspace moved twice.
+	if moves != 4 {
+		t.Errorf("rebalancing made %d moves, want 4; a Workspace moved more than once", moves)
+	}
+}
+
+func TestSetupOptionsValidate(t *testing.T) {
+	cases := map[string]struct {
+		reason  string
+		o       SetupOptions
+		wantErr bool
+	}{
+		"RebalanceOff": {
+			reason: "Without rebalancing the defaults stand.",
+			o:      SetupOptions{RequireShardOffline: true},
+		},
+		"RebalanceWithLocking": {
+			reason: "With the shard-offline check off, the operator has confirmed backend locking.",
+			o:      SetupOptions{Rebalance: true, RebalanceTolerance: 1},
+		},
+		"RebalanceNeedsLocking": {
+			reason:  "Rebalancing moves Workspaces off live shards; without backend locking that lets two applies write one state.",
+			o:       SetupOptions{Rebalance: true, RebalanceTolerance: 1, RequireShardOffline: true},
+			wantErr: true,
+		},
+		"RebalanceToleranceZero": {
+			reason:  "With tolerance 0 a gap of one bounces a Workspace between two shards forever.",
+			o:       SetupOptions{Rebalance: true, RebalanceTolerance: 0},
+			wantErr: true,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := tc.o.validate(); (err != nil) != tc.wantErr {
+				t.Errorf("validate(): error %v, want error %v\n%s", err, tc.wantErr, tc.reason)
+			}
+		})
 	}
 }

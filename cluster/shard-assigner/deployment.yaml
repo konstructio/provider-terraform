@@ -30,6 +30,12 @@ spec:
             - --namespace=crossplane-system
             - --migration-batch=5
             - --stale-migration=30m
+            # Spread existing Workspaces onto new shards after a scale-up.
+            # Only with backend state locking confirmed (S3 use_lockfile):
+            # rebalancing moves Workspaces off shards that are still running.
+            # - --no-require-shard-offline
+            # - --rebalance
+            # - --rebalance-tolerance=1
           ports:
             - name: metrics
               containerPort: 8080

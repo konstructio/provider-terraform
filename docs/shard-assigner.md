@@ -162,14 +162,34 @@ drive a drain it started itself. Same thing you would do for an HPA.
 | `--[no-]require-shard-offline` | on | Refuse to migrate a Workspace while its current shard still has a running pod. It is a kingpin boolean: `--no-require-shard-offline` turns it off, `=false` is rejected. |
 | `--migration-batch` | `5` | How many Workspaces may migrate at once. |
 | `--stale-migration` | `30m` | How long a Workspace that never syncs may hold a batch slot. |
+| `--[no-]rebalance` | off | Move existing Workspaces onto less-loaded shards, e.g. after a scale-up. Requires `--no-require-shard-offline`. |
+| `--rebalance-tolerance` | `1` | How many more Workspaces than the least-loaded shard a shard may carry before rebalancing moves any off it. At least 1. |
 
 ## Operational procedures
 
 ### Scale up (4 → 5)
 
-Raise `shardCount`. A new Deployment appears; **existing Workspaces do not
-move**. Placement is least-loaded, so new Workspaces land on the empty shard.
-Rebalancing existing ones is a separate, deliberate action.
+Raise `shardCount`. A new Deployment appears. By default **existing
+Workspaces do not move**: placement is least-loaded, so only new Workspaces
+land on the empty shard.
+
+With `--rebalance`, existing Workspaces spread onto the new shard too. Adding
+the Deployment re-evaluates every Workspace; any on a shard carrying more than
+`--rebalance-tolerance` (default 1) more Workspaces than the least-loaded one
+moves there, through the ordinary migration path — `migrating-at`, the batch
+limit, the new shard's receipt — until the spread is within the tolerance.
+Each move narrows the gap by 2, which is why the tolerance must be at least 1:
+with 0, a gap of one would bounce a Workspace between two shards forever.
+
+Rebalancing moves Workspaces off shards that are **still running**, which the
+liveness gate below exists to prevent. It is safe only when the backend locks
+state: an apply already running on the old shard holds the lock, and the new
+shard's apply waits for it. So the assigner refuses to start with `--rebalance`
+unless `--no-require-shard-offline` is also set, and that is only for backends
+confirmed to lock (S3 `use_lockfile = true`, a DynamoDB table, GCS, azurerm).
+
+Every moved Workspace runs `terraform init` again on its new shard, so a large
+rebalance costs about as much as draining the same number of Workspaces.
 
 ### Scale down (5 → 4)
 
@@ -261,7 +281,6 @@ Workspace is reconciled by nobody and fails silently otherwise.
 - **Cost-weighted placement.** Placement counts objects. `Placer.cost` is the
   seam for weighting by observed reconcile duration — the reason this is an
   assigner rather than a hash — but it returns 1 for everything today.
-- **Automatic rebalancing** on scale-up.
 - **Structurally eliminating handover overlap.** That needs a per-Workspace
   lease acquired before apply and released after. Unnecessary once backend
   locking is confirmed.

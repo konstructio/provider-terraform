@@ -25,6 +25,7 @@ import (
 	"github.com/pkg/errors"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -103,6 +104,18 @@ type Placer struct {
 	// the wait is logged once when it starts and once when it clears. Guarded
 	// by mu.
 	drainBlocked map[string]bool
+
+	// staleLogged remembers which stale migrations have been reported, by
+	// Workspace UID and migrating-at value, so each is logged once rather than
+	// on every batch check. Guarded by mu.
+	staleLogged map[types.UID]string
+
+	// rebalance moves Workspaces off a shard carrying more than
+	// rebalanceTolerance more load than the least-loaded one. It moves them
+	// off a live shard, so it is only safe when the Terraform backend locks
+	// state - see SetupOptions.
+	rebalance          bool
+	rebalanceTolerance float64
 }
 
 // A PlacerOption configures a Placer.
@@ -146,6 +159,17 @@ func WithKinds(k []Kind) PlacerOption {
 	return func(p *Placer) { p.kinds = k }
 }
 
+// WithRebalance enables moving Workspaces off a shard that carries more than
+// tolerance more load than the least-loaded shard. tolerance must be at least
+// 1: a move narrows the gap by 2, so with 0 a gap of 1 would bounce a
+// Workspace between two shards forever.
+func WithRebalance(tolerance int) PlacerOption {
+	return func(p *Placer) {
+		p.rebalance = true
+		p.rebalanceTolerance = float64(tolerance)
+	}
+}
+
 // WithRequireShardOffline sets whether a Workspace may be migrated while its
 // current shard still has a running pod.
 //
@@ -180,6 +204,7 @@ func NewPlacer(kube client.Reader, log logging.Logger, o ...PlacerOption) *Place
 		cost:           func(Workspace) float64 { return 1 },
 		now:            time.Now,
 		drainBlocked:   map[string]bool{},
+		staleLogged:    map[types.UID]string{},
 	}
 	for _, fn := range o {
 		fn(p)
@@ -305,9 +330,30 @@ func (p *Placer) forEach(ctx context.Context, fn func(Workspace)) error {
 // LeastLoaded returns the active shard carrying the least load. Ties break
 // toward the lowest shard index, so the choice is deterministic.
 func (p *Placer) LeastLoaded(ctx context.Context, f Fleet) (string, error) {
+	load, err := p.load(ctx, f)
+	if err != nil {
+		return "", err
+	}
+	return leastLoaded(f.ActiveShards(), load), nil
+}
+
+// RebalanceTarget reports the shard a Workspace on cur should move to, and
+// whether it should move at all: only when cur carries more than the
+// tolerance more load than the least-loaded active shard.
+func (p *Placer) RebalanceTarget(ctx context.Context, f Fleet, cur string) (string, bool, error) {
+	load, err := p.load(ctx, f)
+	if err != nil {
+		return "", false, err
+	}
+	best := leastLoaded(f.ActiveShards(), load)
+	return best, load[cur]-load[best] > p.rebalanceTolerance, nil
+}
+
+// load sums the cost of the Workspaces on each active shard.
+func (p *Placer) load(ctx context.Context, f Fleet) (map[string]float64, error) {
 	active := f.ActiveShards()
 	if len(active) == 0 {
-		return "", errors.New(errNoActiveShards)
+		return nil, errors.New(errNoActiveShards)
 	}
 
 	load := make(map[string]float64, len(active))
@@ -320,24 +366,28 @@ func (p *Placer) LeastLoaded(ctx context.Context, f Fleet) (string, error) {
 			load[s] += p.cost(ws)
 		}
 	}); err != nil {
-		return "", err
+		return nil, err
 	}
+	return load, nil
+}
 
-	// ActiveShards is index-ordered, so keeping the first strict minimum
-	// gives the lowest-index winner.
+// leastLoaded returns the active shard with the least load. active is
+// index-ordered, so keeping the first strict minimum gives the lowest-index
+// winner.
+func leastLoaded(active []string, load map[string]float64) string {
 	best := active[0]
 	for _, s := range active[1:] {
 		if load[s] < load[best] {
 			best = s
 		}
 	}
-	return best, nil
+	return best
 }
 
 // MigrationsInFlight counts Workspaces that have been relabelled onto a new
 // shard which has not picked them up yet. A migration whose annotation is
 // older than staleAfter, or unparseable, is logged and not counted, so it
-// cannot hold a batch slot forever.
+// cannot hold a batch slot forever. The caller must hold the placement lock.
 func (p *Placer) MigrationsInFlight(ctx context.Context) (int, error) {
 	n := 0
 	err := p.forEach(ctx, func(ws Workspace) {
@@ -356,9 +406,14 @@ func (p *Placer) MigrationsInFlight(ctx context.Context) (int, error) {
 			return
 		}
 		if age := p.now().Sub(started); age > p.staleAfter {
-			p.log.Info("Migration is stale and no longer holds a batch slot; its new shard has not picked the workspace up",
-				"workspace", ws.GetName(), "shard", ws.GetLabels()[ShardLabel],
-				"age", age.String(), "cutoff", p.staleAfter.String())
+			// Every Workspace waiting on the batch lands here on every check,
+			// so report each stale migration once.
+			if p.staleLogged[ws.GetUID()] != at {
+				p.staleLogged[ws.GetUID()] = at
+				p.log.Info("Migration is stale and no longer holds a batch slot; its new shard has not picked the workspace up",
+					"workspace", ws.GetName(), "shard", ws.GetLabels()[ShardLabel],
+					"age", age.String(), "cutoff", p.staleAfter.String())
+			}
 			return
 		}
 		n++

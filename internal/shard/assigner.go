@@ -85,7 +85,13 @@ func (a *Assigner) Reconcile(ctx context.Context, req reconcile.Request) (reconc
 	cur := ws.GetLabels()[ShardLabel]
 	if fleet.Active(cur) {
 		// Happy path, and where the overwhelming majority of calls end.
-		return reconcile.Result{}, a.completeMigration(ctx, ws)
+		if err := a.completeMigration(ctx, ws); err != nil {
+			return reconcile.Result{}, err
+		}
+		if !a.placer.rebalance {
+			return reconcile.Result{}, nil
+		}
+		return a.rebalance(ctx, fleet, ws, cur)
 	}
 
 	// Needs placement: unlabelled, or its owner is draining or out of range.
@@ -140,6 +146,40 @@ func (a *Assigner) Reconcile(ctx context.Context, req reconcile.Request) (reconc
 	if err != nil {
 		return reconcile.Result{}, err
 	}
+	return reconcile.Result{}, a.assign(ctx, ws, cur, target)
+}
+
+// rebalance moves a Workspace off its active shard when that shard carries
+// more than the tolerance more load than the least-loaded one - typically
+// right after a scale-up, when the new shards are empty. Adding a shard
+// Deployment re-evaluates every Workspace, so a scale-up starts this on its
+// own; the informer resync keeps it going.
+//
+// The move goes through the ordinary migration path - migrating-at, the batch
+// limit, the new shard's receipt - but off a shard whose pod is still running.
+// That is safe only because Setup refuses to enable rebalancing unless the
+// Terraform backend is confirmed to lock state: an apply already running on
+// the old shard holds the lock, and the new shard's waits for it.
+func (a *Assigner) rebalance(ctx context.Context, fleet Fleet, ws Workspace, cur string) (reconcile.Result, error) {
+	// Still settling on this shard from a previous move; leave it be.
+	if _, ok := ws.GetAnnotations()[MigratingAtAnnotation]; ok {
+		return reconcile.Result{}, nil
+	}
+
+	defer a.placer.Lock()()
+
+	target, move, err := a.placer.RebalanceTarget(ctx, fleet, cur)
+	if err != nil || !move {
+		return reconcile.Result{}, err
+	}
+	n, err := a.placer.MigrationsInFlight(ctx)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if n >= a.placer.Batch() {
+		return reconcile.Result{RequeueAfter: RequeueMigration}, nil
+	}
+	a.log.Debug("Rebalancing workspace off an overloaded shard", "workspace", ws.GetName(), "from", cur, "to", target)
 	return reconcile.Result{}, a.assign(ctx, ws, cur, target)
 }
 

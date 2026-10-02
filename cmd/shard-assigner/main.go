@@ -60,6 +60,8 @@ func main() {
 		metricsBind = app.Flag("metrics-bind-address", "Address the metrics endpoint binds to.").Default(":8080").String()
 
 		migrationBatch      = app.Flag("migration-batch", "How many Workspaces may migrate at once. Overlap is not the concern - a migration only starts once the old shard's pod is gone - but a whole shard's Workspaces arriving together would pile up on the receiving shards' terraform plugin-cache lock.").Default("5").Int()
+		rebalance           = app.Flag("rebalance", "Move Workspaces off a shard that carries more than --rebalance-tolerance more Workspaces than the least-loaded one, so a scale-up spreads existing Workspaces onto the new shards. It moves them off shards that are still running, so it requires --no-require-shard-offline.").Default("false").Bool()
+		rebalanceTolerance  = app.Flag("rebalance-tolerance", "How many more Workspaces than the least-loaded shard a shard may carry before rebalancing moves any off it. At least 1.").Default("1").Int()
 		requireShardOffline = app.Flag("require-shard-offline", "Refuse to migrate a Workspace while its current shard still has a running pod. Shards are separate processes, so a shard listed in draining may still be mid-apply; moving a Workspace off it lets two terraform processes write the same remote state. Only set this false if the Terraform backend is confirmed to lock state (S3 with a DynamoDB table or use_lockfile, GCS, azurerm).").Default("true").Bool()
 	)
 	kingpin.MustParse(app.Parse(os.Args[1:]))
@@ -107,6 +109,8 @@ func main() {
 		MigrationBatch:      *migrationBatch,
 		CensusInterval:      *censusInterval,
 		RequireShardOffline: *requireShardOffline,
+		Rebalance:           *rebalance,
+		RebalanceTolerance:  *rebalanceTolerance,
 	}), "Cannot setup shard assigner")
 
 	log.Info("Starting shard assigner",
@@ -114,7 +118,9 @@ func main() {
 		"migration-batch", *migrationBatch,
 		"sync-interval", syncInterval.String(),
 		"stale-migration", staleMigration.String(),
-		"require-shard-offline", *requireShardOffline)
+		"require-shard-offline", *requireShardOffline,
+		"rebalance", *rebalance,
+		"rebalance-tolerance", *rebalanceTolerance)
 
 	kingpin.FatalIfError(mgr.Start(ctrl.SetupSignalHandler()), "Cannot start controller manager")
 }
