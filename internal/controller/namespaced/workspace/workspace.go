@@ -126,6 +126,21 @@ type tfclient interface {
 }
 
 // Setup adds a controller that reconciles Workspace managed resources.
+// reconcilerDefaults are the reconciler options every Workspace controller
+// gets.
+//
+// A Workspace's external name is known before it is created, and terraform
+// records what it created in remote state, so retrying a create whose result
+// was lost cannot duplicate anything. The result is lost whenever the reconcile
+// ends before Crossplane can record it - the shard's pod stops mid-create, or
+// terraform outlives the 30s Crossplane leaves after a reconcile timeout.
+// Without this option such a Workspace stops reconciling for good with "cannot
+// determine creation result" until someone removes the
+// crossplane.io/external-create-pending annotation.
+var reconcilerDefaults = []managed.ReconcilerOption{
+	managed.WithDeterministicExternalName(true),
+}
+
 func Setup(mgr ctrl.Manager, o controller.Options, timeout, pollJitter time.Duration) error {
 	name := managed.ControllerName(v1beta1.WorkspaceGroupKind)
 
@@ -150,6 +165,7 @@ func Setup(mgr ctrl.Manager, o controller.Options, timeout, pollJitter time.Dura
 		managed.WithTimeout(timeout),
 		managed.WithMetricRecorder(o.MetricOptions.MRMetrics),
 	}
+	opts = append(opts, reconcilerDefaults...)
 
 	if o.Features.Enabled(features.EnableBetaManagementPolicies) {
 		opts = append(opts, managed.WithManagementPolicies())
