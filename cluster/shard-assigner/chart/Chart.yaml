@@ -1,0 +1,5 @@
+apiVersion: v2
+name: provider-terraform-shards
+description: Sharded provider-terraform controller instances.
+type: application
+version: 0.1.0

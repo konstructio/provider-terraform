@@ -41,6 +41,9 @@ type options struct {
 	// interval is nil when the caller supplied no WithInterval option, in
 	// which case the workdir package's own default (one hour) applies.
 	interval *time.Duration
+
+	// shardName is this instance's shard, empty when unsharded.
+	shardName string
 }
 
 // WithInterval sets how often each garbage collector scans its directory.
@@ -49,6 +52,13 @@ type options struct {
 // supplied at all, the workdir package's default of one hour applies.
 func WithInterval(d time.Duration) Option {
 	return func(o *options) { o.interval = &d }
+}
+
+// WithShardName sets the shard these garbage collectors run for. When set they
+// also reclaim the working directories of Workspaces that have migrated to
+// another shard; without it a drain leaks one directory per Workspace moved.
+func WithShardName(name string) Option {
+	return func(o *options) { o.shardName = name }
 }
 
 // Setup initializes and registers the garbage collectors with the manager.
@@ -82,20 +92,28 @@ func Setup(mgr ctrl.Manager, tfDir string, logger logging.Logger, opts ...Option
 	if o.interval != nil {
 		gcOpts = append(gcOpts, workdir.WithInterval(*o.interval))
 	}
+	if o.shardName != "" {
+		gcOpts = append(gcOpts, workdir.WithShardName(o.shardName))
+	}
+
+	// The API reader, not the manager's client: a sharded manager's cache only
+	// holds this shard's Workspaces, and a garbage collector reading from it
+	// would delete every other shard's working directories.
+	reader := mgr.GetAPIReader()
 
 	// GC for main workspace directory
-	gcWorkspace := workdir.NewGarbageCollector(mgr.GetClient(), tfDir, gcOpts...)
+	gcWorkspace := workdir.NewGarbageCollector(reader, tfDir, gcOpts...)
 	if err := mgr.Add(gcWorkspace); err != nil {
 		return err
 	}
 
 	// GC for temporary workspace directory
-	gcTmp := workdir.NewGarbageCollector(mgr.GetClient(), filepath.Join("/tmp", tfDir), gcOpts...)
+	gcTmp := workdir.NewGarbageCollector(reader, filepath.Join("/tmp", tfDir), gcOpts...)
 	if err := mgr.Add(gcTmp); err != nil {
 		return err
 	}
 
-	logger.Debug("Workspace garbage collectors initialized successfully", "interval", o.interval)
+	logger.Debug("Workspace garbage collectors initialized successfully", "interval", o.interval, "shard", o.shardName)
 
 	return nil
 }

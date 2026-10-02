@@ -51,6 +51,7 @@ import (
 	"github.com/upbound/provider-terraform/internal/features"
 	"github.com/upbound/provider-terraform/internal/githubapp"
 	"github.com/upbound/provider-terraform/internal/terraform"
+	"github.com/upbound/provider-terraform/internal/workdir"
 	"github.com/upbound/provider-terraform/pkg/metrics"
 
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
@@ -125,6 +126,21 @@ type tfclient interface {
 }
 
 // Setup adds a controller that reconciles Workspace managed resources.
+// reconcilerDefaults are the reconciler options every Workspace controller
+// gets.
+//
+// A Workspace's external name is known before it is created, and terraform
+// records what it created in remote state, so retrying a create whose result
+// was lost cannot duplicate anything. The result is lost whenever the reconcile
+// ends before Crossplane can record it - the shard's pod stops mid-create, or
+// terraform outlives the 30s Crossplane leaves after a reconcile timeout.
+// Without this option such a Workspace stops reconciling for good with "cannot
+// determine creation result" until someone removes the
+// crossplane.io/external-create-pending annotation.
+var reconcilerDefaults = []managed.ReconcilerOption{
+	managed.WithDeterministicExternalName(true),
+}
+
 func Setup(mgr ctrl.Manager, o controller.Options, timeout, pollJitter time.Duration) error {
 	name := managed.ControllerName(v1beta1.WorkspaceGroupKind)
 
@@ -149,6 +165,7 @@ func Setup(mgr ctrl.Manager, o controller.Options, timeout, pollJitter time.Dura
 		managed.WithTimeout(timeout),
 		managed.WithMetricRecorder(o.MetricOptions.MRMetrics),
 	}
+	opts = append(opts, reconcilerDefaults...)
 
 	if o.Features.Enabled(features.EnableBetaManagementPolicies) {
 		opts = append(opts, managed.WithManagementPolicies())
@@ -203,6 +220,16 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		return nil, errors.New(errNotWorkspace)
 	}
 	l := c.logger.WithValues("request", map[string]string{"name": cr.Name})
+	// On a Workspace the shard assigner just moved here, record that this
+	// shard has picked it up once setup - including terraform init - has been
+	// attempted, successful or not. That releases the assigner's migration
+	// batch slot; a failure is not worth failing the reconcile over, since the
+	// assigner stops counting the migration after --stale-migration anyway.
+	defer func() {
+		if err := workdir.MarkMigrationReceived(ctx, c.kube, cr, time.Now()); err != nil {
+			l.Debug("Cannot mark migration received", "error", err)
+		}
+	}()
 	// NOTE(negz): This directory will be garbage collected by the workdir
 	// garbage collector that is started in Setup.
 	dir := filepath.Join(tfDir, string(cr.GetUID()))

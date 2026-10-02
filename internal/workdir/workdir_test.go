@@ -294,3 +294,127 @@ func TestCollect(t *testing.T) {
 	}
 
 }
+
+func TestCollectWithShardName(t *testing.T) {
+	parentDir := "/test"
+
+	const (
+		uidMine       = "11111111-1111-1111-1111-111111111111"
+		uidOtherShard = "22222222-2222-2222-2222-222222222222"
+		uidUnlabelled = "33333333-3333-3333-3333-333333333333"
+		uidMineNS     = "44444444-4444-4444-4444-444444444444"
+		uidGone       = "55555555-5555-5555-5555-555555555555"
+	)
+
+	shardedList := test.NewMockListFn(nil, func(obj client.ObjectList) error {
+		switch v := obj.(type) {
+		case *clusterv1beta1.WorkspaceList:
+			*v = clusterv1beta1.WorkspaceList{Items: []clusterv1beta1.Workspace{
+				{ObjectMeta: metav1.ObjectMeta{
+					UID:    types.UID(uidMine),
+					Labels: map[string]string{ShardLabel: "shard-0"},
+				}},
+				{ObjectMeta: metav1.ObjectMeta{
+					UID:    types.UID(uidOtherShard),
+					Labels: map[string]string{ShardLabel: "shard-1"},
+				}},
+				{ObjectMeta: metav1.ObjectMeta{UID: types.UID(uidUnlabelled)}},
+			}}
+		case *namespacedv1beta1.WorkspaceList:
+			*v = namespacedv1beta1.WorkspaceList{Items: []namespacedv1beta1.Workspace{
+				{ObjectMeta: metav1.ObjectMeta{
+					UID:    types.UID(uidMineNS),
+					Labels: map[string]string{ShardLabel: "shard-0"},
+				}},
+			}}
+		}
+		return nil
+	})
+
+	dirs := func() afero.Afero {
+		return withDirs(afero.Afero{Fs: afero.NewMemMapFs()},
+			parentDir,
+			filepath.Join(parentDir, uidMine),
+			filepath.Join(parentDir, uidOtherShard),
+			filepath.Join(parentDir, uidUnlabelled),
+			filepath.Join(parentDir, uidMineNS),
+			filepath.Join(parentDir, uidGone),
+			filepath.Join(parentDir, "registry.terraform.io"),
+		)
+	}
+
+	type fields struct {
+		kube       client.Client
+		parentdDir string
+		fs         afero.Afero
+		shardName  string
+	}
+	type args struct {
+		ctx context.Context
+	}
+	type want struct {
+		dirs []string
+		err  error
+	}
+	cases := map[string]struct {
+		reason string
+		fields fields
+		args   args
+		want   want
+	}{
+		"ReclaimsOtherShardsWorkdirs": {
+			reason: "A workdir whose Workspace has migrated to another shard is a leftover; without reclaiming it every migration leaks a directory.",
+			fields: fields{
+				kube:       &test.MockClient{MockList: shardedList},
+				parentdDir: parentDir,
+				fs:         dirs(),
+				shardName:  "shard-0",
+			},
+			want: want{
+				// uidMine and uidMineNS are ours. uidOtherShard migrated away,
+				// uidUnlabelled is reconciled by nobody, uidGone is deleted.
+				dirs: []string{uidMine, uidMineNS, "registry.terraform.io"},
+			},
+		},
+		"UnshardedKeepsEveryExistingWorkspace": {
+			reason: "With no shard name the collector is the stock one: only workdirs of Workspaces that no longer exist are removed.",
+			fields: fields{
+				kube:       &test.MockClient{MockList: shardedList},
+				parentdDir: parentDir,
+				fs:         dirs(),
+				shardName:  "",
+			},
+			want: want{
+				dirs: []string{uidMine, uidOtherShard, uidUnlabelled, uidMineNS, "registry.terraform.io"},
+			},
+		},
+		"ShardOwningNothingReclaimsAll": {
+			reason: "A shard that owns no Workspace keeps no workdirs, which is what lets a drained shard be scaled to zero cleanly.",
+			fields: fields{
+				kube:       &test.MockClient{MockList: shardedList},
+				parentdDir: parentDir,
+				fs:         dirs(),
+				shardName:  "shard-9",
+			},
+			want: want{
+				dirs: []string{"registry.terraform.io"},
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			gc := NewGarbageCollector(tc.fields.kube, tc.fields.parentdDir,
+				WithFs(tc.fields.fs), WithShardName(tc.fields.shardName))
+			err := gc.collect(tc.args.ctx)
+			if diff := cmp.Diff(tc.want.err, err, test.EquateErrors()); diff != "" {
+				t.Errorf("gc.collect(...): -want error, +got error:\n%s\n%s", diff, tc.reason)
+			}
+
+			got := getDirs(tc.fields.fs, tc.fields.parentdDir)
+			if diff := cmp.Diff(tc.want.dirs, got, cmpopts.EquateEmpty(), cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
+				t.Errorf("gc.collect(...): -want dirs, +got dirs:\n%s\n%s", diff, tc.reason)
+			}
+		})
+	}
+}

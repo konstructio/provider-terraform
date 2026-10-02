@@ -40,14 +40,27 @@ const (
 	errFmtReadDir     = "cannot read directory %q"
 )
 
+// ShardLabel names the controller shard that owns a Workspace. A sharded
+// provider instance watches only the Workspaces carrying its own --shard-name
+// in this label, and its garbage collector reclaims the working directories of
+// everything else.
+const ShardLabel = "terraform.crossplane.io/shard"
+
 // A GarbageCollector garbage collects the working directories of Terraform
 // workspaces that no longer exist.
 type GarbageCollector struct {
-	kube      client.Client
+	// kube is deliberately a Reader, not a Client. A sharded manager's cache
+	// is filtered to one shard, so a cached list would make this collector
+	// treat every other shard's working directory as orphaned and delete it.
+	// Callers must supply an uncached reader - mgr.GetAPIReader().
+	kube      client.Reader
 	parentDir string
 	fs        afero.Afero
 	interval  time.Duration
 	log       logging.Logger
+
+	// shardName is this instance's shard, or empty when unsharded.
+	shardName string
 }
 
 // A GarbageCollectorOption configures a new GarbageCollector.
@@ -71,9 +84,20 @@ func WithLogger(l logging.Logger) GarbageCollectorOption {
 	return func(gc *GarbageCollector) { gc.log = l }
 }
 
+// WithShardName configures the shard this garbage collector runs for. When
+// set, the collector reclaims the working directories of Workspaces that
+// belong to another shard as well as those that no longer exist. The default
+// is unsharded: every existing Workspace is owned.
+func WithShardName(name string) GarbageCollectorOption {
+	return func(gc *GarbageCollector) { gc.shardName = name }
+}
+
 // NewGarbageCollector returns a garbage collector that garbage collects the
 // working directories of Terraform workspaces.
-func NewGarbageCollector(c client.Client, parentDir string, o ...GarbageCollectorOption) *GarbageCollector {
+//
+// c must be an uncached reader when the provider is sharded; see the kube
+// field on GarbageCollector.
+func NewGarbageCollector(c client.Reader, parentDir string, o ...GarbageCollectorOption) *GarbageCollector {
 	gc := &GarbageCollector{
 		kube:      c,
 		parentDir: parentDir,
@@ -108,6 +132,21 @@ func (gc *GarbageCollector) Start(ctx context.Context) error {
 	}
 }
 
+// owns reports whether this collector's shard is responsible for a Workspace
+// carrying the given labels. An unsharded collector owns everything.
+//
+// A Workspace labelled for another shard is deliberately not owned: the
+// working directory here is a leftover from before it migrated, and reclaiming
+// it is what stops every migration leaking a directory. An unlabelled
+// Workspace is owned by no shard - nothing reconciles it - so its directory is
+// reclaimed too.
+func (gc *GarbageCollector) owns(labels map[string]string) bool {
+	if gc.shardName == "" {
+		return true
+	}
+	return labels[ShardLabel] == gc.shardName
+}
+
 func isUUID(u string) bool {
 	_, err := uuid.Parse(u)
 	return err == nil
@@ -139,7 +178,9 @@ func (gc *GarbageCollector) collect(ctx context.Context) error { //nolint:gocycl
 	} else {
 		listedAny = true
 		for _, ws := range clusterList.Items {
-			exists[string(ws.GetUID())] = true
+			if gc.owns(ws.GetLabels()) {
+				exists[string(ws.GetUID())] = true
+			}
 		}
 	}
 
@@ -164,7 +205,9 @@ func (gc *GarbageCollector) collect(ctx context.Context) error { //nolint:gocycl
 	} else {
 		listedAny = true
 		for _, ws := range namespacedList.Items {
-			exists[string(ws.GetUID())] = true
+			if gc.owns(ws.GetLabels()) {
+				exists[string(ws.GetUID())] = true
+			}
 		}
 	}
 
