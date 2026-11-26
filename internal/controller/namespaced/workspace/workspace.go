@@ -49,6 +49,7 @@ import (
 	"github.com/upbound/provider-terraform/apis/namespaced/v1beta1"
 	tfClient "github.com/upbound/provider-terraform/internal/clients"
 	"github.com/upbound/provider-terraform/internal/features"
+	"github.com/upbound/provider-terraform/internal/gitcred"
 	"github.com/upbound/provider-terraform/internal/githubapp"
 	"github.com/upbound/provider-terraform/internal/terraform"
 	"github.com/upbound/provider-terraform/pkg/metrics"
@@ -66,7 +67,6 @@ const (
 	errMkdir              = "cannot make Terraform configuration directory"
 	errRemoteModule       = "cannot get remote Terraform module"
 	errFluxArtefactModule = "cannot get Flux Artefact Terraform module"
-	errSetGitCredDir      = "cannot set GIT_CRED_DIR environment variable"
 	errWriteCreds         = "cannot write Terraform credentials"
 	errWriteGitCreds      = "cannot write .git-credentials to /tmp dir"
 	errWriteConfig        = "cannot write Terraform configuration " + tfConfig
@@ -218,7 +218,11 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		return nil, errors.Wrap(err, "failed to resolve provider config")
 	}
 
-	// Make git credentials available to inline and remote sources
+	// Make git credentials available to inline and remote sources. They are
+	// written to this Workspace's own directory, and git is pointed at it per
+	// process (see package gitcred): Workspaces can hold tokens for different
+	// GitHub orgs, so the directory must never be shared process state.
+	gitCredDir := ""
 	for _, cd := range pc.Spec.Credentials {
 		if cd.Filename != gitCredentialsFilename {
 			continue
@@ -247,20 +251,15 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		}
 		// NOTE(bobh66): Put the git credentials file in /tmp/tf/<UUID> so it doesn't get removed or overwritten
 		// by the remote module source case
-		gitCredDir := filepath.Clean(filepath.Join("/tmp", dir))
-		if err = c.fs.MkdirAll(gitCredDir, 0700); err != nil {
+		credDir := filepath.Clean(filepath.Join("/tmp", dir))
+		if err = c.fs.MkdirAll(credDir, 0700); err != nil {
 			return nil, errors.Wrap(err, errWriteGitCreds)
 		}
-
-		// NOTE(ytsarev): Make go-getter pick up .git-credentials, see /.gitconfig in the container image
-		err = os.Setenv("GIT_CRED_DIR", gitCredDir)
-		if err != nil {
-			return nil, errors.Wrap(err, errSetGitCredDir)
-		}
-		p := filepath.Clean(filepath.Join(gitCredDir, filepath.Base(cd.Filename)))
+		p := filepath.Clean(filepath.Join(credDir, filepath.Base(cd.Filename)))
 		if err := c.fs.WriteFile(p, data, 0600); err != nil {
 			return nil, errors.Wrap(err, errWriteGitCreds)
 		}
+		gitCredDir = credDir
 	}
 
 	// Calculate the final terraform working directory (including entrypoint if specified)
@@ -310,14 +309,21 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 
 		// Pull remote source if needed
 		if shouldPull {
+			// Ctx bounds the download by the reconcile timeout: it runs under
+			// the gitcred lock, so a hung clone must not block every other
+			// Workspace's download indefinitely.
 			gc := getter.Client{
+				Ctx:  ctx,
 				Src:  cr.Spec.ForProvider.Module,
 				Dst:  dir,
 				Pwd:  dir,
 				Mode: getter.ClientModeDir,
 			}
 			fetchTimer := metrics.NewModuleFetchTimer(cr.Name, cr.Spec.ForProvider.Module)
-			err := gc.Get()
+			// go-getter runs git with the process environment, so the
+			// download holds the gitcred lock with GIT_CRED_DIR set to
+			// this Workspace's credentials.
+			err := gitcred.WithDir(gitCredDir, gc.Get)
 			if err != nil {
 				fetchTimer.RecordFailure()
 				return nil, errors.Wrap(err, errRemoteModule)
@@ -463,6 +469,13 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 			}
 		}
 		envs[idx] = strings.Join([]string{env.Name, runtimeVal}, "=")
+	}
+
+	// terraform init fetches git module sources (including modules nested in
+	// a remote module) with this Workspace's credentials. Spec env entries
+	// come later, so an explicit GIT_CRED_DIR in the spec still wins.
+	if gitCredDir != "" {
+		envs = append([]string{gitcred.Env(gitCredDir)}, envs...)
 	}
 
 	tf := c.terraform(dir, *pc.Spec.PluginCache, cr.Spec.ForProvider.EnableTerraformCLILogging, l, envs...)
